@@ -73,7 +73,7 @@ def world_model_imagine_data(replay_buffer: ReplayBuffer,
     return latent, action, None, None, reward_hat, termination_hat
 
 
-def joint_train_world_model_agent(env_name, max_steps, num_envs, image_size,
+def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, image_size,
                                   replay_buffer: ReplayBuffer,
                                   world_model: WorldModel, agent: agents.ActorCriticAgent,
                                   train_dynamics_every_steps, train_agent_every_steps,
@@ -105,7 +105,10 @@ def joint_train_world_model_agent(env_name, max_steps, num_envs, image_size,
                 if len(context_action) == 0:
                     action = vec_env.action_space.sample()
                 else:
-                    context_latent = world_model.encode_obs(torch.cat(list(context_obs), dim=1))
+                    if model_name == 'dino':
+                        context_latent, _, _ = world_model.encode_obs(torch.cat(list(context_obs), dim=1))
+                    else:
+                        context_latent = world_model.encode_obs(torch.cat(list(context_obs), dim=1))
                     model_context_action = np.stack(list(context_action), axis=1)
                     model_context_action = torch.Tensor(model_context_action).cuda()
                     prior_flattened_sample, last_dist_feat = world_model.calc_last_dist_feat(context_latent, model_context_action)
@@ -187,14 +190,28 @@ def joint_train_world_model_agent(env_name, max_steps, num_envs, image_size,
 
 
 def build_world_model(conf, action_dim):
-    return WorldModel(
-        in_channels=conf.Models.WorldModel.InChannels,
-        action_dim=action_dim,
-        transformer_max_length=conf.Models.WorldModel.TransformerMaxLength,
-        transformer_hidden_dim=conf.Models.WorldModel.TransformerHiddenDim,
-        transformer_num_layers=conf.Models.WorldModel.TransformerNumLayers,
-        transformer_num_heads=conf.Models.WorldModel.TransformerNumHeads
-    ).cuda()
+    if conf.Models.WorldModel.Transformer == 'TransformerKVCache':
+        wm = WorldModel(
+            in_channels=conf.Models.WorldModel.InChannels,
+            action_dim=action_dim,
+            transformer_max_length=conf.Models.WorldModel.TransformerMaxLength,
+            transformer_hidden_dim=conf.Models.WorldModel.TransformerHiddenDim,
+            transformer_num_layers=conf.Models.WorldModel.TransformerNumLayers,
+            transformer_num_heads=conf.Models.WorldModel.TransformerNumHeads,
+            conf=conf,
+        ).cuda()
+    elif conf.Models.WorldModel.Transformer == 'TransformerXL':
+        wm = WorldModel(
+            in_channels=conf.Models.WorldModel.InChannels,
+            action_dim=action_dim,
+            transformer_max_length=conf.Models.WorldModel.TransformerMaxLength,
+            transformer_hidden_dim=conf.Models.WorldModel.TransformerHiddenDim,
+            transformer_num_layers=conf.Models.WorldModel.TransformerNumLayers,
+            transformer_num_heads=conf.Models.WorldModel.TransformerNumHeads,
+            conf=conf,
+        ).cuda()
+    return wm
+
 
 
 def build_agent(conf, action_dim):
@@ -260,6 +277,7 @@ if __name__ == "__main__":
 
         # train
         joint_train_world_model_agent(
+            model_name=conf.model,
             env_name=args.env_name,
             num_envs=conf.JointTrainAgent.NumEnvs,
             max_steps=conf.JointTrainAgent.SampleMaxSteps,

@@ -8,9 +8,10 @@ from torch.cuda.amp import autocast
 
 from sub_models.functions_losses import SymLogTwoHotLoss
 from sub_models.attention_blocks import get_subsequent_mask_with_batch_length, get_subsequent_mask
-from sub_models.transformer_model import StochasticTransformerKVCache
+from sub_models.transformer_model import StochasticTransformerKVCache, TransformerXL
 import agents
-
+from math import sqrt
+from sub_models.dino_sam import DinoSAM_OCextractor, SpatialBroadcastDecoder
 
 class EncoderBN(nn.Module):
     def __init__(self, in_channels, stem_channels, final_feature_width) -> None:
@@ -215,7 +216,7 @@ class CategoricalKLDivLossWithFreeBits(nn.Module):
 
 class WorldModel(nn.Module):
     def __init__(self, in_channels, action_dim,
-                 transformer_max_length, transformer_hidden_dim, transformer_num_layers, transformer_num_heads):
+                 transformer_max_length, transformer_hidden_dim, transformer_num_layers, transformer_num_heads, conf):
         super().__init__()
         self.transformer_hidden_dim = transformer_hidden_dim
         self.final_feature_width = 4
@@ -225,33 +226,57 @@ class WorldModel(nn.Module):
         self.tensor_dtype = torch.bfloat16 if self.use_amp else torch.float32
         self.imagine_batch_size = -1
         self.imagine_batch_length = -1
+        self.conf = conf
 
-        self.encoder = EncoderBN(
-            in_channels=in_channels,
-            stem_channels=32,
-            final_feature_width=self.final_feature_width
-        )
-        self.storm_transformer = StochasticTransformerKVCache(
-            stoch_dim=self.stoch_flattened_dim,
-            action_dim=action_dim,
-            feat_dim=transformer_hidden_dim,
-            num_layers=transformer_num_layers,
-            num_heads=transformer_num_heads,
-            max_length=transformer_max_length,
-            dropout=0.1
-        )
+        if conf.model == 'dino':
+            decoder_config = conf.decoder
+            slot_attn_config = conf.slot_attn
+            self.dino = DinoSAM_OCextractor(conf, decoder_config, slot_attn_config)
+            transformer_layer_config = conf.transformer_layer
+            self.storm_transformer = TransformerXL(
+                transformer_layer_config=transformer_layer_config, 
+                num_layers=conf.transformer_num_layers,
+                max_length=transformer_max_length,
+                mem_length=conf.transformer_mem_length,
+            )
+
+            self.image_decoder = SpatialBroadcastDecoder(
+                resolution=conf.image_decoder.resolution, 
+                dec_input_dim=conf.image_decoder.input_dim,
+                dec_hidden_dim=conf.image_decoder.dec_hidden_dim,
+                out_ch=conf.image_decoder.out_channels
+            )
+
+        else:
+        
+            self.encoder = EncoderBN(
+                in_channels=in_channels,
+                stem_channels=32,
+                final_feature_width=self.final_feature_width
+            )
+            self.storm_transformer = StochasticTransformerKVCache(
+                stoch_dim=self.stoch_flattened_dim,
+                action_dim=action_dim,
+                feat_dim=transformer_hidden_dim,
+                num_layers=transformer_num_layers,
+                num_heads=transformer_num_heads,
+                max_length=transformer_max_length,
+                dropout=0.1
+            )
+            self.image_decoder = DecoderBN(
+                stoch_dim=self.stoch_flattened_dim,
+                last_channels=self.encoder.last_channels,
+                original_in_channels=in_channels,
+                stem_channels=32,
+                final_feature_width=self.final_feature_width
+            )
+
         self.dist_head = DistHead(
             image_feat_dim=self.encoder.last_channels*self.final_feature_width*self.final_feature_width,
             transformer_hidden_dim=transformer_hidden_dim,
             stoch_dim=self.stoch_dim
         )
-        self.image_decoder = DecoderBN(
-            stoch_dim=self.stoch_flattened_dim,
-            last_channels=self.encoder.last_channels,
-            original_in_channels=in_channels,
-            stem_channels=32,
-            final_feature_width=self.final_feature_width
-        )
+        
         self.reward_decoder = RewardDecoder(
             num_classes=255,
             embedding_size=self.stoch_flattened_dim,
@@ -271,12 +296,26 @@ class WorldModel(nn.Module):
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
     def encode_obs(self, obs):
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
-            embedding = self.encoder(obs)
-            post_logits = self.dist_head.forward_post(embedding)
-            sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
-            flattened_sample = self.flatten_sample(sample)
-        return flattened_sample
+        if self.conf.model=='dino':
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+                embedding, inits, z_vit = self.dino_encode(obs) 
+                post_logits = self.dist_head.forward_post(embedding)
+                sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
+                return sample, inits, z_vit
+        else:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+                embedding = self.encoder(obs)
+                post_logits = self.dist_head.forward_post(embedding)
+                sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
+                flattened_sample = self.flatten_sample(sample)
+            return flattened_sample
+        
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        shape = z.shape  # (..., C, D)
+        z = z.view(-1, *shape[-2:])
+        rec, _, _ = self.decoder(z)
+        rec = rec.reshape(*shape[:-2], *rec.shape[1:])
+        return rec
 
     def calc_last_dist_feat(self, latent, action):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
@@ -345,7 +384,10 @@ class WorldModel(nn.Module):
 
         self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype)
         # context
-        context_latent = self.encode_obs(sample_obs)
+        if self.conf.model == 'dino':
+            context_latent, _, _  = self.encode_obs(sample_obs)
+        else:
+            context_latent = self.encode_obs(sample_obs)
         for i in range(sample_obs.shape[1]):  # context_length is sample_obs.shape[1]
             last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat = self.predict_next(
                 context_latent[:, i:i+1],
@@ -381,10 +423,16 @@ class WorldModel(nn.Module):
 
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
             # encoding
-            embedding = self.encoder(obs)
+            if self.conf.model == 'dino':
+                embedding, inits, z_vit = self.encoder(obs)
+                reconstructions = self.decode(embedding)
+                
+            else:
+                embedding = self.encoder(obs)
             post_logits = self.dist_head.forward_post(embedding)
             sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
-            flattened_sample = self.flatten_sample(sample)
+            
+            flattened_sample = sample if self.conf.model=='dino' else self.flatten_sample(sample) 
 
             # decoding image
             obs_hat = self.image_decoder(flattened_sample)
@@ -397,8 +445,11 @@ class WorldModel(nn.Module):
             reward_hat = self.reward_decoder(dist_feat)
             termination_hat = self.termination_decoder(dist_feat)
 
-            # env loss
-            reconstruction_loss = self.mse_loss_func(obs_hat, obs)
+            # DINO losses
+            consistency_loss = self.dino.cosine_loss(embedding) if self.conf.model == 'dino' else 0
+            dino_reconstruction_loss = torch.pow(z_vit - reconstructions, 2).mean() if self.conf.model == 'dino' else 0
+            # STORM env losses
+            reconstruction_loss = self.mse_loss_func(obs_hat, obs.mul(2).sub(1)) + dino_reconstruction_loss + consistency_loss if self.conf.model == 'dino' else self.mse_loss_func(obs_hat, obs)
             reward_loss = self.symlog_twohot_loss_func(reward_hat, reward)
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
             # dyn-rep loss
@@ -423,3 +474,69 @@ class WorldModel(nn.Module):
             logger.log("WorldModel/representation_loss", representation_loss.item())
             logger.log("WorldModel/representation_real_kl_div", representation_real_kl_div.item())
             logger.log("WorldModel/total_loss", total_loss.item())
+
+
+    def vit_encode(self, x: torch.Tensor) -> torch.Tensor:
+        def _transformer_compute_positions(features):
+            """Compute positions for Transformer features."""
+            n_tokens = features.shape[1]
+            image_size = sqrt(n_tokens)
+            image_size_int = int(image_size)
+            assert (
+                image_size_int == image_size
+            ), "Position computation for Transformers requires square image"
+    
+            spatial_dims = (image_size_int, image_size_int)
+            positions = torch.cartesian_prod(
+                *[torch.linspace(0.0, 1.0, steps=dim, device=features.device) for dim in spatial_dims]
+            )
+            return positions
+        
+        if self.dino.run_in_eval_mode and self.dino.training:
+            self.dino.eval()
+  
+        if self.dino.vit_freeze:
+            # Speed things up a bit by not requiring grad computation.
+            with torch.no_grad():
+                features = self.dino.vit.forward_features(x)
+        else:
+            features = self.dino.vit.forward_features(x)
+  
+        if self.dino._feature_hooks is not None:
+            hook_features = [hook.pop() for hook in self._feature_hooks]
+  
+        if len(self.dino.feature_levels) == 0:
+            # Remove class token when not using hooks.
+            features = features[:, 1:]
+            positions = _transformer_compute_positions(features)
+        else:
+            features = hook_features[: len(self.dino.feature_levels)]
+            positions = _transformer_compute_positions(features[0])
+            features = torch.cat(features, dim=-1)
+  
+        return features, positions
+  
+    def dino_encode(self, x: torch.Tensor):
+    
+        shape = x.shape  # (..., C, H, W)
+        x = x.view(-1, *shape[-3:])
+        z, _ = self.vit_encode(x)
+        z = self.dino.pos_embed(z)
+  
+        if self.dino.slot_attn.is_video:
+            z = z.reshape(*shape[:-3], *z.shape[1:]) # video
+            if z.dim() == 3:
+                z = z.unsqueeze(1)
+        z, inits = self.dino.slot_attn(z)
+        if self.dino.slot_attn.is_video:
+            z = z.view(-1, *z.shape[-2:]) # video
+            inits = inits.view(-1, *inits.shape[-2:]) # video
+  
+        z_vit, _ = self.vit_encode(x)
+        
+        # Reshape to original
+        z = z.reshape(*shape[:-3], *z.shape[1:])
+        inits = inits.reshape(*shape[:-3], *inits.shape[1:])
+        z_vit = z_vit.reshape(*shape[:-3], *z_vit.shape[1:])
+  
+        return z, inits, z_vit

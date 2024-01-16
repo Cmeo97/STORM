@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import repeat, rearrange
-
+import copy
 from sub_models.attention_blocks import get_vector_mask
-from sub_models.attention_blocks import PositionalEncoding1D, AttentionBlock, AttentionBlockKVCache
+from sub_models.attention_blocks import PositionalEncoding1D, AttentionBlock, AttentionBlockKVCache, RelativeMultiheadSelfAttention, PositionalEncoding
 
 
 class StochasticTransformer(nn.Module):
@@ -100,3 +100,116 @@ class StochasticTransformerKVCache(nn.Module):
             feats, attn = layer(feats, self.kv_cache_list[idx], self.kv_cache_list[idx], mask)
 
         return feats
+
+
+
+class TransformerXL(nn.Module):
+
+    def __init__(self, decoder_layer_config, num_layers, max_length, mem_length, batch_first=True, slot_based=True):
+        super().__init__()
+        
+        decoder_layer = TransformerXLDecoderLayer(decoder_layer_config)
+        self.layers = nn.ModuleList([copy.deepcopy(decoder_layer) for _ in range(num_layers)])
+        self.num_layers = num_layers
+        self.mem_length = mem_length
+        self.batch_first = batch_first
+        self.slot_based = slot_based
+        self.pos_enc = PositionalEncoding(decoder_layer.embed_dim, max_length, dropout_p=decoder_layer.dropout_p)
+        self.u_bias = nn.Parameter(torch.Tensor(decoder_layer.num_heads, decoder_layer.head_dim))
+        self.v_bias = nn.Parameter(torch.Tensor(decoder_layer.num_heads, decoder_layer.head_dim))
+        nn.init.xavier_uniform_(self.u_bias)
+        nn.init.xavier_uniform_(self.v_bias)
+
+    def init_mems(self):
+        if self.mem_length > 0:
+            param = next(self.parameters())
+            dtype, device = param.dtype, param.device
+            mems = []
+            for i in range(self.num_layers + 1):
+                mems.append(torch.empty(0, dtype=dtype, device=device))
+            return mems
+        else:
+            return None
+
+    def forward(self, x, positions, attn_mask, mems=None, tgt_length=None, generation=False):
+        if self.batch_first:
+            x = x.transpose(0, 1)
+
+        if mems is None:
+            mems = self.init_mems()
+
+        if tgt_length is None:
+            tgt_length = x.shape[0]
+        assert tgt_length > 0
+      
+        pos_enc = self.pos_enc(positions)
+        hiddens = [x]
+        #attentions = []
+        out = x
+        for i, layer in enumerate(self.layers):
+            out = layer(out, pos_enc, self.u_bias, self.v_bias, attn_mask=attn_mask, mems=mems[i])
+            hiddens.append(out)
+            #attentions.append(attention)
+
+        out = out[-tgt_length:]   #check in the tmw repository dimensionality of out!!
+
+        if self.batch_first:
+            out = out.transpose(0, 1)
+
+        assert len(hiddens) == len(mems)
+        if generation and self.slot_based:
+            with torch.no_grad():
+                for i in range(len(hiddens)):
+                    mems[i] = torch.cat([mems[i], hiddens[i]], dim=0)[-self.mem_length:] 
+        else:
+            with torch.no_grad():
+                for i in range(len(hiddens)):
+                    mems[i] = torch.cat([mems[i], hiddens[i][0].unsqueeze(0)], dim=0)[-self.mem_length:] 
+        return out, mems
+
+
+def get_activation(nonlinearity, param=None):
+    if nonlinearity is None or nonlinearity == 'none' or nonlinearity == 'linear':
+        return nn.Identity()
+    elif nonlinearity == 'relu':
+        return nn.ReLU()
+    elif nonlinearity == 'leaky_relu':
+        if param is None:
+            param = 1e-2
+        return nn.LeakyReLU(negative_slope=param)
+    elif nonlinearity == 'elu':
+        if param is None:
+            param = 1.0
+        return nn.ELU(alpha=param)
+    elif nonlinearity == 'silu':
+        return nn.SiLU()
+    elif nonlinearity == 'tanh':
+        return nn.Tanh()
+    else:
+        raise ValueError(f'Unsupported nonlinearity: {nonlinearity}')
+    
+
+class TransformerXLDecoderLayer(nn.Module):
+
+    def __init__(self, embed_dim, feedforward_dim, head_dim, num_heads, activation, dropout_p, layer_norm_eps=1e-5):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.head_dim = head_dim
+        self.num_heads = num_heads
+        self.dropout_p = dropout_p
+        self.self_attn = RelativeMultiheadSelfAttention(embed_dim, head_dim, num_heads, dropout_p)
+        self.linear1 = nn.Linear(embed_dim, feedforward_dim)
+        self.linear2 = nn.Linear(feedforward_dim, embed_dim)
+        self.norm1 = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
+        self.norm2 = nn.LayerNorm(embed_dim, eps=layer_norm_eps)
+        self.act = get_activation(activation)
+        self.dropout = nn.Dropout(dropout_p) if dropout_p > 0 else nn.Identity()
+
+    def _ff(self, x):
+        x = self.linear2(self.dropout(self.act(self.linear1(x))))
+        return self.dropout(x)
+
+    def forward(self, x, pos_encodings, u_bias, v_bias, attn_mask=None, mems=None):
+        x = self.norm1(x + self.self_attn(x, pos_encodings, u_bias, v_bias, attn_mask, mems))
+        x = self.norm2(x + self._ff(x))
+        return x

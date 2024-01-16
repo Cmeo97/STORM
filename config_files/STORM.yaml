@@ -29,6 +29,7 @@ Models:
     TransformerHiddenDim: 512
     TransformerNumLayers: 2
     TransformerNumHeads: 8
+    Transformer: TransformerKVCache
 
   Agent:
     NumLayers: 2

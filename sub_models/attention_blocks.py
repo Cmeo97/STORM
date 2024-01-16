@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from einops import rearrange, repeat
-
+import math
 
 def get_subsequent_mask(seq):
     ''' For masking out the subsequent info. '''
@@ -170,3 +170,93 @@ class PositionalEncoding1D(nn.Module):
 
         feat = feat + pos_emb[:, position:position+1, :]
         return feat
+
+
+class RelativeMultiheadSelfAttention(nn.Module):
+
+    def __init__(self, dim, head_dim, num_heads, dropout_p):
+        super().__init__()
+        self.dim = dim
+        self.head_dim = head_dim
+        self.num_heads = num_heads
+        self.scale = 1 / (dim ** 0.5)
+
+        self.qkv_proj = nn.Linear(dim, 3 * num_heads * head_dim, bias=False)
+        self.pos_proj = nn.Linear(dim, num_heads * head_dim, bias=False)
+        self.out_proj = nn.Linear(num_heads * head_dim, dim, bias=False)
+        self.dropout = nn.Dropout(dropout_p) if dropout_p > 0 else nn.Identity()
+
+    def _rel_shift(self, x):
+        zero_pad = torch.zeros((x.shape[0], 1, *x.shape[2:]), device=x.device, dtype=x.dtype)
+        x_padded = torch.cat([zero_pad, x], dim=1)
+        x_padded = x_padded.view(x.shape[1] + 1, x.shape[0], *x.shape[2:])
+        x = x_padded[1:].view_as(x)
+        return x
+
+    def forward(self, x, pos_encodings, u_bias, v_bias, attn_mask=None, mems=None):
+        tgt_length, batch_size = x.shape[:2]
+        pos_len = pos_encodings.shape[0]
+
+        if mems is not None:
+            cat = torch.cat([mems, x], dim=0)
+            qkv = self.qkv_proj(cat)
+            q, k, v = torch.chunk(qkv, 3, dim=-1)
+            q = q[-tgt_length:]
+        else:
+            qkv = self.qkv_proj(x)
+            q, k, v = torch.chunk(qkv, 3, dim=-1)
+
+        pos_encodings = self.pos_proj(pos_encodings)
+
+        src_length = k.shape[0]
+        num_heads = self.num_heads
+        head_dim = self.head_dim
+
+        q = q.view(tgt_length, batch_size, num_heads, head_dim)
+        k = k.view(src_length, batch_size, num_heads, head_dim)
+        v = v.view(src_length, batch_size, num_heads, head_dim)
+        pos_encodings = pos_encodings.view(pos_len, num_heads, head_dim)
+
+        content_score = torch.einsum('ibnd,jbnd->ijbn', (q + u_bias, k))
+        pos_score = torch.einsum('ibnd,jnd->ijbn', (q + v_bias, pos_encodings))
+        pos_score = self._rel_shift(pos_score)
+
+        # [tgt_length x src_length x batch_size x num_heads]
+        attn_score = content_score + pos_score
+        attn_score.mul_(self.scale)
+
+        if attn_mask is not None:
+            if attn_mask.ndim == 2:
+                attn_score = attn_score.masked_fill(attn_mask[:, :, None, None], -float('inf'))
+            elif attn_mask.ndim == 3:
+                attn_score = attn_score.masked_fill(attn_mask[:, :, :, None], -float('inf'))
+
+        # [tgt_length x src_length x batch_size x num_heads]
+        attn = F.softmax(attn_score, dim=1)
+        attn = self.dropout(attn)
+
+        context = torch.einsum('ijbn,jbnd->ibnd', (attn, v))
+        context = context.reshape(context.shape[0], context.shape[1], num_heads * head_dim)
+        return self.dropout(self.out_proj(context))
+
+
+class PositionalEncoding(nn.Module):
+
+    def __init__(self, dim, max_length, dropout_p=0, batch_first=False):
+        super().__init__()
+        self.dim = dim
+        self.max_length = max_length
+        self.batch_first = batch_first
+        self.dropout = nn.Dropout(dropout_p) if dropout_p > 0 else nn.Identity()
+
+        encodings = torch.zeros(max_length, dim)
+        position = torch.arange(0, max_length, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
+        encodings[:, 0::2] = torch.sin(position * div_term)
+        encodings[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('encodings', encodings)
+
+    def forward(self, positions):
+        out = self.encodings[positions]
+        out = self.dropout(out)
+        return out.unsqueeze(0) if self.batch_first else out.unsqueeze(1)

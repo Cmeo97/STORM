@@ -1,0 +1,82 @@
+Task: "JointTrainAgent"
+
+BasicSettings:
+  Seed: 0
+  ImageSize: 64
+  ReplayBufferOnGPU: True
+
+JointTrainAgent:
+  SampleMaxSteps: 102000
+  BufferMaxLength: 100000
+  BufferWarmUp: 1024
+  NumEnvs: 1
+  BatchSize: 16
+  DemonstrationBatchSize: 4
+  BatchLength: 64
+  ImagineBatchSize: 1024
+  ImagineDemonstrationBatchSize: 256
+  ImagineContextLength: 8
+  ImagineBatchLength: 16
+  TrainDynamicsEverySteps: 1
+  TrainAgentEverySteps: 1
+  UseDemonstration: False
+  SaveEverySteps: 2500
+
+Models:
+  WorldModel:
+    InChannels: 3
+    TransformerMaxLength: 64
+    TransformerHiddenDim: 512
+    TransformerNumLayers: 2
+    TransformerNumHeads: 8
+    Transformer: TransformerXL
+    _target_: models.TransformerConfig
+    tokens_per_block: 8  #17
+    max_blocks: 20
+    attention: 'causal'
+    num_layers: 10
+    num_heads: 4
+    embed_dim: 256
+    embed_pdrop: 0.1
+    resid_pdrop: 0.1
+    attn_pdrop: 0.1
+    model: 'OC-irisXL'
+    continuos_embed_dim: 128
+    dyn_num_heads: 4
+    dyn_num_layers: 10
+    dyn_feedforward_dim: 1024
+    dyn_head_dim: 64
+    dyn_z_dims: [512, 512, 512, 512]
+    dyn_reward_dims: [256, 256, 256, 256]
+    dyn_discount_dims: [256, 256, 256, 256]
+    dyn_input_rewards: True
+    dyn_input_discounts: False
+    dyn_act: 'silu'
+    dyn_norm: 'none'
+    dyn_dropout: 0.1
+    dyn_lr: 1e-4
+    dyn_wd: 1e-6
+    dyn_eps: 1e-5
+    dyn_grad_clip: 100
+    dyn_z_coef: 1
+    dyn_reward_coef: 10
+    dyn_discount_coef: 50
+    wm_batch_size: 100
+    wm_sequence_length: 340
+    wm_train_steps: 1
+    wm_memory_length: 8
+    wm_discount_threshold: 0.1
+    regularization_post_quant: False
+    regularization_tokens: False
+    regularization_embeddings: False
+    embedding_input: False
+    slot_based: False
+    slot_regularization: False
+    regularization_k_pred: False
+
+  Agent:
+    NumLayers: 2
+    HiddenDim: 512
+    Gamma: 0.985
+    Lambda: 0.95
+    EntropyCoef: 3E-4
