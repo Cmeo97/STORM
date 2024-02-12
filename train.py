@@ -44,8 +44,8 @@ def build_vec_env(env_name, image_size, num_envs, seed):
     return vec_env
 
 
-def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel, batch_size, demonstration_batch_size, batch_length, logger):
-    obs, action, reward, termination = replay_buffer.sample(batch_size, demonstration_batch_size, batch_length)
+def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel, batch_size, demonstration_batch_size, batch_length, logger, device):
+    obs, action, reward, termination = replay_buffer.sample(batch_size, demonstration_batch_size, batch_length, device)
     world_model.update(obs, action, reward, termination, logger=logger)
 
 
@@ -54,7 +54,7 @@ def world_model_imagine_data(replay_buffer: ReplayBuffer,
                              world_model: WorldModel, agent: agents.ActorCriticAgent,
                              imagine_batch_size, imagine_demonstration_batch_size,
                              imagine_context_length, imagine_batch_length,
-                             log_video, logger):
+                             log_video, logger, device):
     '''
     Sample context from replay buffer, then imagine data with world model and agent
     '''
@@ -62,13 +62,14 @@ def world_model_imagine_data(replay_buffer: ReplayBuffer,
     agent.eval()
 
     sample_obs, sample_action, sample_reward, sample_termination = replay_buffer.sample(
-        imagine_batch_size, imagine_demonstration_batch_size, imagine_context_length)
+        imagine_batch_size, imagine_demonstration_batch_size, imagine_context_length, device)
     latent, action, reward_hat, termination_hat = world_model.imagine_data(
         agent, sample_obs, sample_action,
         imagine_batch_size=imagine_batch_size+imagine_demonstration_batch_size,
         imagine_batch_length=imagine_batch_length,
         log_video=log_video,
-        logger=logger
+        logger=logger,
+        device=device
     )
     return latent, action, None, None, reward_hat, termination_hat
 
@@ -80,7 +81,7 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
                                   batch_size, demonstration_batch_size, batch_length,
                                   imagine_batch_size, imagine_demonstration_batch_size,
                                   imagine_context_length, imagine_batch_length,
-                                  save_every_steps, seed, logger):
+                                  save_every_steps, seed, logger, device):
     # create ckpt dir
     os.makedirs(f"ckpt/{args.n}", exist_ok=True)
 
@@ -105,19 +106,19 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
                 if len(context_action) == 0:
                     action = vec_env.action_space.sample()
                 else:
-                    if model_name == 'dino':
+                    if model_name == 'OC-irisXL':
                         context_latent, _, _ = world_model.encode_obs(torch.cat(list(context_obs), dim=1))
                     else:
                         context_latent = world_model.encode_obs(torch.cat(list(context_obs), dim=1))
                     model_context_action = np.stack(list(context_action), axis=1)
-                    model_context_action = torch.Tensor(model_context_action).cuda()
+                    model_context_action = torch.Tensor(model_context_action).to()
                     prior_flattened_sample, last_dist_feat = world_model.calc_last_dist_feat(context_latent, model_context_action)
                     action = agent.sample_as_env_action(
                         torch.cat([prior_flattened_sample, last_dist_feat], dim=-1),
                         greedy=False
                     )
 
-            context_obs.append(rearrange(torch.Tensor(current_obs).cuda(), "B H W C -> B 1 C H W")/255)
+            context_obs.append(rearrange(torch.Tensor(current_obs).to(device), "B H W C -> B 1 C H W")/255)
             context_action.append(action)
         else:
             action = vec_env.action_space.sample()
@@ -148,7 +149,8 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
                 batch_size=batch_size,
                 demonstration_batch_size=demonstration_batch_size,
                 batch_length=batch_length,
-                logger=logger
+                logger=logger,
+                device=device
             )
         # <<< train world model part
 
@@ -168,7 +170,8 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
                 imagine_context_length=imagine_context_length,
                 imagine_batch_length=imagine_batch_length,
                 log_video=log_video,
-                logger=logger
+                logger=logger,
+                device=device
             )
 
             agent.update(
@@ -189,7 +192,7 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
             torch.save(agent.state_dict(), f"ckpt/{args.n}/agent_{total_steps}.pth")
 
 
-def build_world_model(conf, action_dim):
+def build_world_model(conf, action_dim, device):
     if conf.Models.WorldModel.Transformer == 'TransformerKVCache':
         wm = WorldModel(
             in_channels=conf.Models.WorldModel.InChannels,
@@ -199,7 +202,7 @@ def build_world_model(conf, action_dim):
             transformer_num_layers=conf.Models.WorldModel.TransformerNumLayers,
             transformer_num_heads=conf.Models.WorldModel.TransformerNumHeads,
             conf=conf,
-        ).cuda()
+        ).to(device)
     elif conf.Models.WorldModel.Transformer == 'TransformerXL':
         wm = WorldModel(
             in_channels=conf.Models.WorldModel.InChannels,
@@ -209,12 +212,12 @@ def build_world_model(conf, action_dim):
             transformer_num_layers=conf.Models.WorldModel.TransformerNumLayers,
             transformer_num_heads=conf.Models.WorldModel.TransformerNumHeads,
             conf=conf,
-        ).cuda()
+        ).to(device)
     return wm
 
 
 
-def build_agent(conf, action_dim):
+def build_agent(conf, action_dim, device):
     return agents.ActorCriticAgent(
         feat_dim=32*32+conf.Models.WorldModel.TransformerHiddenDim,
         num_layers=conf.Models.Agent.NumLayers,
@@ -223,7 +226,7 @@ def build_agent(conf, action_dim):
         gamma=conf.Models.Agent.Gamma,
         lambd=conf.Models.Agent.Lambda,
         entropy_coef=conf.Models.Agent.EntropyCoef,
-    ).cuda()
+    ).to(device)
 
 
 if __name__ == "__main__":
@@ -240,6 +243,7 @@ if __name__ == "__main__":
     parser.add_argument("-config_path", type=str, required=True)
     parser.add_argument("-env_name", type=str, required=True)
     parser.add_argument("-trajectory_path", type=str, required=True)
+    parser.add_argument("-device", type=str, required=False, default='cuda:0')
     args = parser.parse_args()
     conf = load_config(args.config_path)
     print(colorama.Fore.RED + str(args) + colorama.Style.RESET_ALL)
@@ -258,8 +262,8 @@ if __name__ == "__main__":
         action_dim = dummy_env.action_space.n
 
         # build world model and agent
-        world_model = build_world_model(conf, action_dim)
-        agent = build_agent(conf, action_dim)
+        world_model = build_world_model(conf, action_dim, args.device)
+        agent = build_agent(conf, action_dim, args.device)
 
         # build replay buffer
         replay_buffer = ReplayBuffer(
@@ -267,17 +271,18 @@ if __name__ == "__main__":
             num_envs=conf.JointTrainAgent.NumEnvs,
             max_length=conf.JointTrainAgent.BufferMaxLength,
             warmup_length=conf.JointTrainAgent.BufferWarmUp,
-            store_on_gpu=conf.BasicSettings.ReplayBufferOnGPU
+            store_on_gpu=conf.BasicSettings.ReplayBufferOnGPU,
+            device=args.device,
         )
 
         # judge whether to load demonstration trajectory
         if conf.JointTrainAgent.UseDemonstration:
             print(colorama.Fore.MAGENTA + f"loading demonstration trajectory from {args.trajectory_path}" + colorama.Style.RESET_ALL)
-            replay_buffer.load_trajectory(path=args.trajectory_path)
+            replay_buffer.load_trajectory(path=args.trajectory_path, device=args.device)
 
         # train
         joint_train_world_model_agent(
-            model_name=conf.model,
+            model_name=conf.Models.WorldModel.model,
             env_name=args.env_name,
             num_envs=conf.JointTrainAgent.NumEnvs,
             max_steps=conf.JointTrainAgent.SampleMaxSteps,
@@ -296,7 +301,8 @@ if __name__ == "__main__":
             imagine_batch_length=conf.JointTrainAgent.ImagineBatchLength,
             save_every_steps=conf.JointTrainAgent.SaveEverySteps,
             seed=args.seed,
-            logger=logger
+            logger=logger,
+            device=args.device
         )
     else:
         raise NotImplementedError(f"Task {conf.Task} not implemented")

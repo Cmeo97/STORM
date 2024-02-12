@@ -18,13 +18,13 @@ def percentile(x, percentage):
     return per
 
 
-def calc_lambda_return(rewards, values, termination, gamma, lam, dtype=torch.float32):
+def calc_lambda_return(rewards, values, termination, gamma, lam, dtype=torch.float32, device='cuda:0'):
     # Invert termination to have 0 if the episode ended and 1 otherwise
     inv_termination = (termination * -1) + 1
 
     batch_size, batch_length = rewards.shape[:2]
     # gae_step = torch.zeros((batch_size, ), dtype=dtype, device="cuda")
-    gamma_return = torch.zeros((batch_size, batch_length+1), dtype=dtype, device="cuda")
+    gamma_return = torch.zeros((batch_size, batch_length+1), dtype=dtype, device=device)
     gamma_return[:, -1] = values[:, -1]
     for t in reversed(range(batch_length)):  # with last bootstrap
         gamma_return[:, t] = \
@@ -35,14 +35,14 @@ def calc_lambda_return(rewards, values, termination, gamma, lam, dtype=torch.flo
 
 
 class ActorCriticAgent(nn.Module):
-    def __init__(self, feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef) -> None:
+    def __init__(self, feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef, device='cuda:0') -> None:
         super().__init__()
         self.gamma = gamma
         self.lambd = lambd
         self.entropy_coef = entropy_coef
         self.use_amp = True
         self.tensor_dtype = torch.bfloat16 if self.use_amp else torch.float32
-
+        self.device = device
         self.symlog_twohot_loss = SymLogTwoHotLoss(255, -20, 20)
 
         actor = [
@@ -113,7 +113,7 @@ class ActorCriticAgent(nn.Module):
     @torch.no_grad()
     def sample(self, latent, greedy=False):
         self.eval()
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+        with torch.autocast(device_type=self.device, dtype=torch.bfloat16, enabled=self.use_amp):
             logits = self.policy(latent)
             dist = distributions.Categorical(logits=logits)
             if greedy:
@@ -139,9 +139,9 @@ class ActorCriticAgent(nn.Module):
 
             # decode value, calc lambda return
             slow_value = self.slow_value(latent)
-            slow_lambda_return = calc_lambda_return(reward, slow_value, termination, self.gamma, self.lambd)
+            slow_lambda_return = calc_lambda_return(reward, slow_value, termination, self.gamma, self.lambd, self.device)
             value = self.symlog_twohot_loss.decode(raw_value)
-            lambda_return = calc_lambda_return(reward, value, termination, self.gamma, self.lambd)
+            lambda_return = calc_lambda_return(reward, value, termination, self.gamma, self.lambd, self.device)
 
             # update value function with slow critic regularization
             value_loss = self.symlog_twohot_loss(raw_value[:, :-1], lambda_return.detach())
@@ -150,7 +150,7 @@ class ActorCriticAgent(nn.Module):
             lower_bound = self.lowerbound_ema(percentile(lambda_return, 0.05))
             upper_bound = self.upperbound_ema(percentile(lambda_return, 0.95))
             S = upper_bound-lower_bound
-            norm_ratio = torch.max(torch.ones(1).cuda(), S)  # max(1, S) in the paper
+            norm_ratio = torch.max(torch.ones(1).to(self.device), S)  # max(1, S) in the paper
             norm_advantage = (lambda_return-value[:, :-1]) / norm_ratio
             policy_loss = -(log_prob * norm_advantage.detach()).mean()
 

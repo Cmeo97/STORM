@@ -7,8 +7,9 @@ from einops.layers.torch import Rearrange
 from torch.cuda.amp import autocast
 
 from sub_models.functions_losses import SymLogTwoHotLoss
-from sub_models.attention_blocks import get_subsequent_mask_with_batch_length, get_subsequent_mask
+from sub_models.attention_blocks import get_subsequent_mask_with_batch_length, get_subsequent_mask, get_causal_mask
 from sub_models.transformer_model import StochasticTransformerKVCache, TransformerXL
+
 import agents
 from math import sqrt
 from sub_models.dino_sam import DinoSAM_OCextractor, SpatialBroadcastDecoder
@@ -135,13 +136,40 @@ class DistHead(nn.Module):
 
     def forward_post(self, x):
         logits = self.post_head(x)
-        logits = rearrange(logits, "B L (K C) -> B L K C", K=self.stoch_dim)
+        logits = rearrange(logits, "B L S (K C) -> B L S K C", K=self.stoch_dim)
         logits = self.unimix(logits)
         return logits
 
     def forward_prior(self, x):
         logits = self.prior_head(x)
         logits = rearrange(logits, "B L (K C) -> B L K C", K=self.stoch_dim)
+        logits = self.unimix(logits)
+        return logits
+
+class OCDistHead(nn.Module):
+    '''
+    Dist: abbreviation of distribution
+    '''
+    def __init__(self, image_feat_dim, transformer_hidden_dim, stoch_dim) -> None:
+        super().__init__()
+        self.stoch_dim = stoch_dim
+        self.post_head = nn.Linear(image_feat_dim, stoch_dim*stoch_dim)
+        self.prior_head = nn.Linear(transformer_hidden_dim, stoch_dim*stoch_dim)
+
+    def unimix(self, logits, mixing_ratio=0.01):
+        # uniform noise mixing
+        probs = F.softmax(logits, dim=-1)
+        mixed_probs = mixing_ratio * torch.ones_like(probs) / self.stoch_dim + (1-mixing_ratio) * probs
+        logits = torch.log(mixed_probs)
+        return logits
+
+    def forward_post(self, x):
+        logits = self.post_head(x)
+        logits = self.unimix(logits)
+        return logits
+
+    def forward_prior(self, x):
+        logits = self.prior_head(x)
         logits = self.unimix(logits)
         return logits
 
@@ -228,27 +256,32 @@ class WorldModel(nn.Module):
         self.imagine_batch_length = -1
         self.conf = conf
 
-        if conf.model == 'dino':
-            decoder_config = conf.decoder
-            slot_attn_config = conf.slot_attn
-            self.dino = DinoSAM_OCextractor(conf, decoder_config, slot_attn_config)
-            transformer_layer_config = conf.transformer_layer
+        if conf.Models.WorldModel.model == 'OC-irisXL':
+            decoder_config = conf.Models.Decoder
+            slot_attn_config = conf.Models.Slot_attn
+            self.dino = DinoSAM_OCextractor(conf.Models.WorldModel, decoder_config, slot_attn_config)
+            
             self.storm_transformer = TransformerXL(
-                transformer_layer_config=transformer_layer_config, 
-                num_layers=conf.transformer_num_layers,
-                max_length=transformer_max_length,
-                mem_length=conf.transformer_mem_length,
+                stoch_dim=self.stoch_flattened_dim,
+                action_dim=action_dim,
+                feat_dim=transformer_hidden_dim,
+                transformer_layer_config=conf.Models.WorldModel.transformer_layer, 
+                num_layers=conf.Models.WorldModel.TransformerNumLayers,
+                max_length=conf.Models.WorldModel.TransformerMaxLength,
+                mem_length=conf.Models.WorldModel.wm_memory_length,
             )
-
             self.image_decoder = SpatialBroadcastDecoder(
-                resolution=conf.image_decoder.resolution, 
-                dec_input_dim=conf.image_decoder.input_dim,
-                dec_hidden_dim=conf.image_decoder.dec_hidden_dim,
-                out_ch=conf.image_decoder.out_channels
+                resolution=conf.Models.Decoder.resolution, 
+                dec_input_dim=conf.Models.Decoder.dec_input_dim,
+                dec_hidden_dim=conf.Models.Decoder.dec_hidden_dim,
+                out_ch=conf.Models.Decoder.out_ch
             )
-
+            self.dist_head = DistHead(
+                image_feat_dim=conf.Models.Slot_attn.token_dim,
+                transformer_hidden_dim=transformer_hidden_dim,
+                stoch_dim=self.stoch_dim
+            )
         else:
-        
             self.encoder = EncoderBN(
                 in_channels=in_channels,
                 stem_channels=32,
@@ -270,13 +303,12 @@ class WorldModel(nn.Module):
                 stem_channels=32,
                 final_feature_width=self.final_feature_width
             )
+            self.dist_head = DistHead(
+                image_feat_dim=self.encoder.last_channels*self.final_feature_width*self.final_feature_width,
+                transformer_hidden_dim=transformer_hidden_dim,
+                stoch_dim=self.stoch_dim
+            )
 
-        self.dist_head = DistHead(
-            image_feat_dim=self.encoder.last_channels*self.final_feature_width*self.final_feature_width,
-            transformer_hidden_dim=transformer_hidden_dim,
-            stoch_dim=self.stoch_dim
-        )
-        
         self.reward_decoder = RewardDecoder(
             num_classes=255,
             embedding_size=self.stoch_flattened_dim,
@@ -296,11 +328,12 @@ class WorldModel(nn.Module):
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
     def encode_obs(self, obs):
-        if self.conf.model=='dino':
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
-                embedding, inits, z_vit = self.dino_encode(obs) 
-                post_logits = self.dist_head.forward_post(embedding)
+        if self.conf.Models.WorldModel.model=='OC-irisXL':
+            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
+                slots, inits, z_vit = self.dino_encode(obs) 
+                post_logits = self.dist_head.forward_post(slots)
                 sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
+                sample = {'sample': sample, 'slots': slots}
                 return sample, inits, z_vit
         else:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
@@ -312,9 +345,9 @@ class WorldModel(nn.Module):
         
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         shape = z.shape  # (..., C, D)
-        z = z.view(-1, *shape[-2:])
-        rec, _, _ = self.decoder(z)
-        rec = rec.reshape(*shape[:-2], *rec.shape[1:])
+        z = z.view(-1, *shape[-3:])
+        rec = self.image_decoder(z)
+        rec = rec.reshape(*shape[:-3], *rec.shape[1:])
         return rec
 
     def calc_last_dist_feat(self, latent, action):
@@ -357,9 +390,13 @@ class WorldModel(nn.Module):
         return sample
 
     def flatten_sample(self, sample):
-        return rearrange(sample, "B L K C -> B L (K C)")
+        if sample.dim() == 5:
+            sample = rearrange(sample, "B L T K C -> B L T (K C)")
+        else:
+            sample = rearrange(sample, "B L K C -> B L (K C)")
+        return sample
 
-    def init_imagine_buffer(self, imagine_batch_size, imagine_batch_length, dtype):
+    def init_imagine_buffer(self, imagine_batch_size, imagine_batch_length, dtype, device):
         '''
         This can slightly improve the efficiency of imagine_data
         But may vary across different machines
@@ -371,21 +408,23 @@ class WorldModel(nn.Module):
             latent_size = (imagine_batch_size, imagine_batch_length+1, self.stoch_flattened_dim)
             hidden_size = (imagine_batch_size, imagine_batch_length+1, self.transformer_hidden_dim)
             scalar_size = (imagine_batch_size, imagine_batch_length)
-            self.latent_buffer = torch.zeros(latent_size, dtype=dtype, device="cuda")
-            self.hidden_buffer = torch.zeros(hidden_size, dtype=dtype, device="cuda")
-            self.action_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
-            self.reward_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
-            self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
+            self.latent_buffer = torch.zeros(latent_size, dtype=dtype, device=device)
+            self.hidden_buffer = torch.zeros(hidden_size, dtype=dtype, device=device)
+            self.action_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
+            self.reward_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
+            self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
 
     def imagine_data(self, agent: agents.ActorCriticAgent, sample_obs, sample_action,
-                     imagine_batch_size, imagine_batch_length, log_video, logger):
+                     imagine_batch_size, imagine_batch_length, log_video, logger, device):
         self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype)
         obs_hat_list = []
 
-        self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype)
+        self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype, device=device)
         # context
-        if self.conf.model == 'dino':
-            context_latent, _, _  = self.encode_obs(sample_obs)
+        if self.conf.Models.WorldModel.model == 'OC-irisXL':
+            context_sample, _, _  = self.encode_obs(sample_obs)
+            context_latent = context_sample['sample']
+            context_slots = context_sample['slots']
         else:
             context_latent = self.encode_obs(sample_obs)
         for i in range(sample_obs.shape[1]):  # context_length is sample_obs.shape[1]
@@ -421,35 +460,39 @@ class WorldModel(nn.Module):
         self.train()
         batch_size, batch_length = obs.shape[:2]
 
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_amp):
             # encoding
-            if self.conf.model == 'dino':
-                embedding, inits, z_vit = self.encoder(obs)
-                reconstructions = self.decode(embedding)
-                
+            if self.conf.Models.WorldModel.model == 'OC-irisXL':
+                embedding, _, z_vit = self.dino_encode(obs)  # embedding = slots
+                reconstructions = self.dino.decode(embedding)
+                history_length = embedding.shape[1]
+                src_length = tgt_length = history_length * self.conf.Models.Slot_attn.num_slots
+                device = embedding.device
+                positions = torch.arange(history_length, -1, -1, device=device).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=0).long() if self.conf.Models.WorldModel.slot_based  else torch.arange(src_length - 1, -1, -1, device=device) 
             else:
                 embedding = self.encoder(obs)
+                
             post_logits = self.dist_head.forward_post(embedding)
             sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
             
-            flattened_sample = sample if self.conf.model=='dino' else self.flatten_sample(sample) 
+            flattened_sample = self.flatten_sample(sample) if self.conf.Models.WorldModel.use_onehot else embedding.detach()
 
             # decoding image
-            obs_hat = self.image_decoder(flattened_sample)
+            obs_hat = self.image_decoder(rearrange(embedding, 'B T S E-> (B T) S E').unsqueeze(-1).detach()) if self.conf.Models.WorldModel.model=='OC-irisXL' else self.image_decoder(flattened_sample)
 
             # transformer
-            temporal_mask = get_subsequent_mask_with_batch_length(batch_length, flattened_sample.device)
-            dist_feat = self.storm_transformer(flattened_sample, action, temporal_mask)
+            temporal_mask = get_causal_mask(src_length, tgt_length, embedding.device, termination, self.conf.Models.WorldModel.num_slots) if self.conf.Models.WorldModel.model == 'OC-irisXL' else get_subsequent_mask_with_batch_length(batch_length, flattened_sample.device)
+            dist_feat = self.storm_transformer(flattened_sample, action, positions, attn_mask=temporal_mask, tgt_length=tgt_length) if self.conf.Models.WorldModel.model == 'OC-irisXL' else self.storm_transformer(flattened_sample, action, temporal_mask) 
             prior_logits = self.dist_head.forward_prior(dist_feat)
             # decoding reward and termination with dist_feat
             reward_hat = self.reward_decoder(dist_feat)
             termination_hat = self.termination_decoder(dist_feat)
 
             # DINO losses
-            consistency_loss = self.dino.cosine_loss(embedding) if self.conf.model == 'dino' else 0
-            dino_reconstruction_loss = torch.pow(z_vit - reconstructions, 2).mean() if self.conf.model == 'dino' else 0
+            consistency_loss = self.dino.cosine_loss(embedding) if self.conf.Models.WorldModel.model == 'OC-irisXL' else 0
+            dino_reconstruction_loss = torch.pow(z_vit - reconstructions, 2).mean() if self.conf.Models.WorldModel.model == 'OC-irisXL' else 0
             # STORM env losses
-            reconstruction_loss = self.mse_loss_func(obs_hat, obs.mul(2).sub(1)) + dino_reconstruction_loss + consistency_loss if self.conf.model == 'dino' else self.mse_loss_func(obs_hat, obs)
+            reconstruction_loss = self.mse_loss_func(obs_hat, obs.mul(2).sub(1)) + dino_reconstruction_loss + consistency_loss if self.conf.Models.WorldModel.model == 'OC-irisXL' else self.mse_loss_func(obs_hat, obs)
             reward_loss = self.symlog_twohot_loss_func(reward_hat, reward)
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
             # dyn-rep loss
@@ -503,7 +546,7 @@ class WorldModel(nn.Module):
             features = self.dino.vit.forward_features(x)
   
         if self.dino._feature_hooks is not None:
-            hook_features = [hook.pop() for hook in self._feature_hooks]
+            hook_features = [hook.pop() for hook in self.dino._feature_hooks]
   
         if len(self.dino.feature_levels) == 0:
             # Remove class token when not using hooks.

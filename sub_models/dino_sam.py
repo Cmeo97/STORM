@@ -27,55 +27,56 @@ class SAConfig:
 class SlotAttentionVideo(nn.Module):
     def __init__(self, config: SAConfig, eps=1e-8, hidden_dim=128) -> None:
         super().__init__()
-        assert config.slot_dim % config.tokens_per_slot == 0
+        self.slot_dim = config['tokens_per_slot'] * config['token_dim']
+        assert self.slot_dim % config['tokens_per_slot'] == 0
         self.config = config
-        self.num_slots = config.num_slots
-        self.tokens_per_slot = config.tokens_per_slot
-        self.iters = config.iters
+        self.num_slots = config['num_slots']
+        self.tokens_per_slot = config['tokens_per_slot']
+        self.iters = config['iters']
         self.eps = eps
-        self.scale = config.slot_dim**-0.5
+        self.scale = self.slot_dim**-0.5
 
-        self.slots_mu = nn.Parameter(torch.rand(1, 1, config.slot_dim))
-        self.slots_log_sigma = nn.Parameter(torch.randn(1, 1, config.slot_dim))
+        self.slots_mu = nn.Parameter(torch.rand(1, 1, self.slot_dim))
+        self.slots_log_sigma = nn.Parameter(torch.randn(1, 1, self.slot_dim))
         with torch.no_grad():
-            limit = sqrt(6.0 / (1 + config.slot_dim))
+            limit = sqrt(6.0 / (1 + self.slot_dim))
             torch.nn.init.uniform_(self.slots_mu, -limit, limit)
             torch.nn.init.uniform_(self.slots_log_sigma, -limit, limit)
 
-        self.to_q = nn.Linear(config.slot_dim, config.slot_dim, bias=False)
-        self.to_k = nn.Linear(config.channels_enc, config.slot_dim, bias=False)
-        self.to_v = nn.Linear(config.channels_enc, config.slot_dim, bias=False)
+        self.to_q = nn.Linear(self.slot_dim, self.slot_dim, bias=False)
+        self.to_k = nn.Linear(config['channels_enc'], self.slot_dim, bias=False)
+        self.to_v = nn.Linear(config['channels_enc'], self.slot_dim, bias=False)
 
-        self.gru = nn.GRUCell(config.slot_dim, config.slot_dim)
+        self.gru = nn.GRUCell(self.slot_dim, self.slot_dim)
 
-        hidden_dim = max(config.slot_dim, hidden_dim)
+        hidden_dim = max(self.slot_dim, hidden_dim)
 
         self.mlp = nn.Sequential(
-            nn.Linear(config.slot_dim, config.slot_dim*4),
+            nn.Linear(self.slot_dim, self.slot_dim*4),
             nn.ReLU(inplace=True),
-            nn.Linear(config.slot_dim*4, config.slot_dim),
+            nn.Linear(self.slot_dim*4, self.slot_dim),
         )
 
-        if config.prior_class.lower() == 'mlp':
+        if config['prior_class'].lower() == 'mlp':
             self.prior = nn.Sequential(
-                nn.Linear(config.slot_dim, config.slot_dim),
+                nn.Linear(self.slot_dim, self.slot_dim),
                 nn.ReLU(inplace=True),
-                nn.Linear(config.slot_dim, config.slot_dim),
+                nn.Linear(self.slot_dim, self.slot_dim),
             )
-        elif config.prior_class.lower() == 'gru':
-            self.prior = nn.GRU(config.slot_dim, config.slot_dim)
-        elif config.prior_class.lower() == 'none' or config.prior_class.lower() == 'keep':
+        elif config['prior_class'].lower() == 'gru':
+            self.prior = nn.GRU(self.slot_dim, self.slot_dim)
+        elif config['prior_class'].lower() == 'none' or config['prior_class'].lower() == 'keep':
             self.prior = None
         else:
             raise NotImplementedError("prior class not implemented")
-        self.prior_class = config.prior_class
+        self.prior_class = config['prior_class']
 
-        self.predictor = TransformerEncoder(num_blocks=1, d_model=config.slot_dim, num_heads=4, dropout=0.1)
+        self.predictor = TransformerEncoder(num_blocks=1, d_model=self.slot_dim, num_heads=4, dropout=0.1)
 
-        self.norm_input = nn.LayerNorm(config.channels_enc)
-        self.norm_slots = nn.LayerNorm(config.slot_dim)
-        self.norm_pre_ff = nn.LayerNorm(config.slot_dim)
-        self.slot_dim = config.slot_dim
+        self.norm_input = nn.LayerNorm(config['channels_enc'])
+        self.norm_slots = nn.LayerNorm(self.slot_dim)
+        self.norm_pre_ff = nn.LayerNorm(self.slot_dim)
+        self.slot_dim = self.slot_dim
         
         self._init_params()
 
@@ -300,27 +301,27 @@ class MLPDecoder(nn.Module):
         super().__init__()
 
         self.config = config
-        self.dec_input_dim = config.dec_input_dim
-        self.dec_hidden_layers = config.dec_hidden_layers
-        self.dec_output_dim = config.dec_output_dim
+        self.dec_input_dim = config['dec_input_dim']
+        self.dec_hidden_layers = config['dec_hidden_layers']
+        self.dec_output_dim = config['dec_output_dim']
 
-        self.vit_num_patches = config.vit_num_patches
+        self.vit_num_patches = config['vit_num_patches']
         
         layers = []
-        current_dim = config.dec_input_dim
+        current_dim = config['dec_input_dim']
     
-        for dec_hidden_dim in config.dec_hidden_layers:
+        for dec_hidden_dim in config['dec_hidden_layers']:
             layers.append(nn.Linear(current_dim, dec_hidden_dim))
             nn.init.zeros_(layers[-1].bias)
             layers.append(nn.ReLU(inplace=True))
             current_dim = dec_hidden_dim
 
-        layers.append(nn.Linear(current_dim, config.dec_output_dim + 1))
+        layers.append(nn.Linear(current_dim, config['dec_output_dim'] + 1))
         nn.init.zeros_(layers[-1].bias)
         
         self.layers = nn.Sequential(*layers)
 
-        self.pos_embed = nn.Parameter(torch.randn(1, config.vit_num_patches, config.dec_input_dim) * 0.02)
+        self.pos_embed = nn.Parameter(torch.randn(1, config['vit_num_patches'], config['dec_input_dim']) * 0.02)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         # z (bt, k, d)
@@ -358,10 +359,10 @@ class DinoSAM_OCextractor(nn.Module):
         self.vit_feature_level = config.vit_feature_level
 
         self._init_vit()
-        self._init_pos_embed(config.dec_output_dim, slot_attn_config.token_dim)
+        self._init_pos_embed(decoder_config.dec_output_dim, slot_attn_config.token_dim)
 
-        self.width = config.resolution
-        self.height = config.resolution
+        self.width = decoder_config.resolution
+        self.height = decoder_config.resolution
         self.num_slots = slot_attn_config.num_slots
         self.tokens_per_slot = slot_attn_config.tokens_per_slot
         self.slot_based = True
@@ -604,8 +605,8 @@ class SpatialBroadcastDecoder(nn.Module):
     
     def forward(self, x: torch.Tensor, return_indiv_slots=False) -> torch.Tensor:
         bs = x.shape[0]
-        K = x.shape[2] * x.shape[3]
-        x = self.spatial_broadcast(x.permute(0,2,3,1))
+        K = x.shape[1] # number of slots
+        x = self.spatial_broadcast(x.permute(0,1,3,2))
         x = self.pos_embedding(x)
         x = self.layers(x)
 

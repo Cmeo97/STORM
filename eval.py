@@ -50,7 +50,7 @@ def build_vec_env(env_name, image_size, num_envs):
 
 
 def eval_episodes(num_episode, env_name, max_steps, num_envs, image_size,
-                  world_model: WorldModel, agent: agents.ActorCriticAgent):
+                  world_model: WorldModel, agent: agents.ActorCriticAgent, device: str = 'cuda:0'):
     world_model.eval()
     agent.eval()
     vec_env = build_vec_env(env_name, image_size, num_envs=num_envs)
@@ -70,14 +70,14 @@ def eval_episodes(num_episode, env_name, max_steps, num_envs, image_size,
             else:
                 context_latent = world_model.encode_obs(torch.cat(list(context_obs), dim=1))
                 model_context_action = np.stack(list(context_action), axis=1)
-                model_context_action = torch.Tensor(model_context_action).cuda()
+                model_context_action = torch.Tensor(model_context_action).to(device)
                 prior_flattened_sample, last_dist_feat = world_model.calc_last_dist_feat(context_latent, model_context_action)
                 action = agent.sample_as_env_action(
                     torch.cat([prior_flattened_sample, last_dist_feat], dim=-1),
                     greedy=False
                 )
 
-        context_obs.append(rearrange(torch.Tensor(current_obs).cuda(), "B H W C -> B 1 C H W")/255)
+        context_obs.append(rearrange(torch.Tensor(current_obs).to(device), "B H W C -> B 1 C H W")/255)
         context_action.append(action)
 
         obs, reward, done, truncated, info = vec_env.step(action)
@@ -113,6 +113,7 @@ if __name__ == "__main__":
     parser.add_argument("-config_path", type=str, required=True)
     parser.add_argument("-env_name", type=str, required=True)
     parser.add_argument("-run_name", type=str, required=True)
+    parser.add_argument("-device", type=str, required=False, default='cuda:0')
     args = parser.parse_args()
     conf = load_config(args.config_path)
     print(colorama.Fore.RED + str(args) + colorama.Style.RESET_ALL)
@@ -125,7 +126,7 @@ if __name__ == "__main__":
     import train
     dummy_env = build_single_env(args.env_name, conf.BasicSettings.ImageSize)
     action_dim = dummy_env.action_space.n
-    world_model = train.build_world_model(conf, action_dim)
+    world_model = train.build_world_model(conf, action_dim, args.device)
     agent = train.build_agnet(conf, action_dim)
     root_path = f"ckpt/{args.run_name}"
 
@@ -147,7 +148,8 @@ if __name__ == "__main__":
             max_steps=conf.JointTrainAgent.SampleMaxSteps,
             image_size=conf.BasicSettings.ImageSize,
             world_model=world_model,
-            agent=agent
+            agent=agent,
+            devide=args.device
         )
         results.append([step, episode_avg_return])
     with open(f"eval_result/{args.run_name}.csv", "w") as fout:

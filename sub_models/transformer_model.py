@@ -75,13 +75,13 @@ class StochasticTransformerKVCache(nn.Module):
 
         return feats
 
-    def reset_kv_cache_list(self, batch_size, dtype):
+    def reset_kv_cache_list(self, batch_size, dtype, device):
         '''
         Reset self.kv_cache_list
         '''
         self.kv_cache_list = []
         for layer in self.layer_stack:
-            self.kv_cache_list.append(torch.zeros(size=(batch_size, 0, self.feat_dim), dtype=dtype, device="cuda"))
+            self.kv_cache_list.append(torch.zeros(size=(batch_size, 0, self.feat_dim), dtype=dtype, device=device))
 
     def forward_with_kv_cache(self, samples, action):
         '''
@@ -105,18 +105,29 @@ class StochasticTransformerKVCache(nn.Module):
 
 class TransformerXL(nn.Module):
 
-    def __init__(self, decoder_layer_config, num_layers, max_length, mem_length, batch_first=True, slot_based=True):
+    def __init__(self, stoch_dim, action_dim, feat_dim, transformer_layer_config, num_layers, max_length, mem_length, batch_first=True, slot_based=True):
         super().__init__()
         
-        decoder_layer = TransformerXLDecoderLayer(decoder_layer_config)
-        self.layers = nn.ModuleList([copy.deepcopy(decoder_layer) for _ in range(num_layers)])
+        self.action_dim = action_dim
+        self.feat_dim = feat_dim
+
+        # mix image_embedding and action
+        self.stem = nn.Sequential(
+            nn.Linear(stoch_dim+action_dim, feat_dim, bias=False),
+            nn.LayerNorm(feat_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(feat_dim, feat_dim, bias=False),
+            nn.LayerNorm(feat_dim)
+        )
+        transformer_layer = TransformerXLDecoderLayer(**transformer_layer_config)
+        self.layers = nn.ModuleList([copy.deepcopy(transformer_layer) for _ in range(num_layers)])
         self.num_layers = num_layers
         self.mem_length = mem_length
         self.batch_first = batch_first
         self.slot_based = slot_based
-        self.pos_enc = PositionalEncoding(decoder_layer.embed_dim, max_length, dropout_p=decoder_layer.dropout_p)
-        self.u_bias = nn.Parameter(torch.Tensor(decoder_layer.num_heads, decoder_layer.head_dim))
-        self.v_bias = nn.Parameter(torch.Tensor(decoder_layer.num_heads, decoder_layer.head_dim))
+        self.pos_enc = PositionalEncoding(transformer_layer.embed_dim, max_length, dropout_p=transformer_layer.dropout_p)
+        self.u_bias = nn.Parameter(torch.Tensor(transformer_layer.num_heads, transformer_layer.head_dim))
+        self.v_bias = nn.Parameter(torch.Tensor(transformer_layer.num_heads, transformer_layer.head_dim))
         nn.init.xavier_uniform_(self.u_bias)
         nn.init.xavier_uniform_(self.v_bias)
 

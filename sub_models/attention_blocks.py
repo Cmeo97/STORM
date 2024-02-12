@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from einops import rearrange, repeat
 import math
+from functools import lru_cache
 
 def get_subsequent_mask(seq):
     ''' For masking out the subsequent info. '''
@@ -18,6 +19,55 @@ def get_subsequent_mask_with_batch_length(batch_length, device):
     subsequent_mask = (1 - torch.triu(torch.ones((1, batch_length, batch_length), device=device), diagonal=1)).bool()
     return subsequent_mask
 
+
+def get_causal_mask(src_length, tgt_length, device, stop_mask, num_current_tokens, mem_num_tokens=0, generation=False, slot_based=True):
+
+    def _get_base_mask_generation(src_length, tgt_length, device, num_current_tokens, slot_based):
+        src_mask = torch.ones(tgt_length, src_length, dtype=torch.bool, device=device)
+        delta_lengths = src_length - tgt_length
+        if slot_based:
+            for tgt_index in range(tgt_length):
+                complete_square = (num_current_tokens - tgt_index % num_current_tokens)% num_current_tokens if (tgt_index+1)%num_current_tokens==0 and tgt_index>0 else (num_current_tokens - tgt_index % num_current_tokens)
+                src_index = delta_lengths + tgt_index + complete_square 
+                src_mask[tgt_index, :src_index] = False  # rows are targets, columns are sources            for tgt_index in range(tgt_length):
+        else:
+            for tgt_index in range(tgt_length):
+                src_index = delta_lengths + tgt_index 
+                src_mask[tgt_index, :src_index + 1] = False  # rows are targets, columns are sources
+        return src_mask
+
+    src_mask = _get_base_mask_generation(src_length, tgt_length, device, num_current_tokens, slot_based) 
+
+    batch_size, seq_length = stop_mask.shape
+    stop_mask = stop_mask.t()
+    stop_mask_shift_right = torch.cat([stop_mask.new_zeros(1, batch_size), stop_mask], dim=0)
+    stop_mask_shift_left = torch.cat([stop_mask, stop_mask.new_zeros(1, batch_size)], dim=0)
+
+    tril = stop_mask.new_ones(seq_length + 1, seq_length + 1).tril()
+    src = torch.logical_and(stop_mask_shift_left.unsqueeze(0), tril.unsqueeze(-1))
+    src = torch.cummax(src.flip(1), dim=1).values.flip(1)
+
+    shifted_tril = stop_mask.new_ones(seq_length + 1, seq_length + 1).tril(diagonal=-1)
+    tgt = torch.logical_and(stop_mask_shift_right.unsqueeze(1), shifted_tril.unsqueeze(-1))
+    tgt = torch.cummax(tgt, dim=0).values
+
+    idx = torch.logical_and(tgt, src)[:-1, :-1] # remove extra dimensions 
+
+    i, j, k = idx.shape 
+    if generation:
+        idx = idx.reshape(i, 1, j, 1, k).expand(i, num_current_tokens, j, (num_current_tokens + mem_num_tokens), k) \
+            .reshape(i * num_current_tokens, j * (num_current_tokens + mem_num_tokens), k)
+    else:
+        idx = idx.reshape(i, 1, j, 1, k).expand(i, num_current_tokens, j, (num_current_tokens + min(mem_num_tokens, 1)), k) \
+            .reshape(i * num_current_tokens, j * (num_current_tokens + min(mem_num_tokens, 1)), k)
+        
+    
+    idx = idx[-tgt_length:, -src_length:]
+
+    src_mask = src_mask.unsqueeze(-1).tile(1, 1, batch_size)
+    src_mask[idx] = True
+    del stop_mask_shift_left, stop_mask_shift_right, tril, tgt, idx, src, shifted_tril
+    return src_mask
 
 def get_vector_mask(batch_length, device):
     mask = torch.ones((1, 1, batch_length), device=device).bool()

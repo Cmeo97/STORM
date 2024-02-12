@@ -73,10 +73,85 @@ def load_config(config_path):
 
     conf.Models.WorldModel = CN()
     conf.Models.WorldModel.InChannels = 0
+    conf.Models.WorldModel.Transformer = None
     conf.Models.WorldModel.TransformerMaxLength = 0
     conf.Models.WorldModel.TransformerHiddenDim = 0
     conf.Models.WorldModel.TransformerNumLayers = 0
     conf.Models.WorldModel.TransformerNumHeads = 0
+    conf.Models.WorldModel.tokens_per_block = 8  #17
+    conf.Models.WorldModel.max_blocks = 20
+    conf.Models.WorldModel.attention = 'causal'
+    conf.Models.WorldModel.num_layers = 10
+    conf.Models.WorldModel.num_heads = 4
+    conf.Models.WorldModel.embed_dim = 256
+    conf.Models.WorldModel.embed_pdrop = 0.1
+    conf.Models.WorldModel.resid_pdrop = 0.1
+    conf.Models.WorldModel.attn_pdrop = 0.1
+    conf.Models.WorldModel.model = 'OC-irisXL'
+    conf.Models.WorldModel.continuos_embed_dim = 128
+    conf.Models.WorldModel.dyn_num_heads = 4
+    conf.Models.WorldModel.dyn_num_layers = 10
+    conf.Models.WorldModel.dyn_feedforward_dim = 1024
+    conf.Models.WorldModel.dyn_head_dim = 64
+    conf.Models.WorldModel.dyn_z_dims = [512, 512, 512, 512]
+    conf.Models.WorldModel.dyn_reward_dims = [256, 256, 256, 256]
+    conf.Models.WorldModel.dyn_discount_dims = [256, 256, 256, 256]
+    conf.Models.WorldModel.dyn_input_rewards = True
+    conf.Models.WorldModel.dyn_input_discounts = False
+    conf.Models.WorldModel.dyn_act = 'silu'
+    conf.Models.WorldModel.dyn_norm = 'none'
+    conf.Models.WorldModel.dyn_dropout = 0.1
+    conf.Models.WorldModel.dyn_lr = 1e-4
+    conf.Models.WorldModel.dyn_wd = 1e-6
+    conf.Models.WorldModel.dyn_eps = 1e-5
+    conf.Models.WorldModel.dyn_grad_clip = 100
+    conf.Models.WorldModel.dyn_z_coef = 1
+    conf.Models.WorldModel.dyn_reward_coef = 10
+    conf.Models.WorldModel.dyn_discount_coef = 50
+    conf.Models.WorldModel.wm_batch_size = 100
+    conf.Models.WorldModel.wm_sequence_length = 340
+    conf.Models.WorldModel.wm_train_steps = 1
+    conf.Models.WorldModel.wm_memory_length = 8
+    conf.Models.WorldModel.wm_discount_threshold = 0.1
+    conf.Models.WorldModel.regularization_post_quant = False
+    conf.Models.WorldModel.regularization_tokens = False
+    conf.Models.WorldModel.regularization_embeddings = False
+    conf.Models.WorldModel.embedding_input = False
+    conf.Models.WorldModel.slot_based = False
+    conf.Models.WorldModel.slot_regularization = False
+    conf.Models.WorldModel.regularization_k_pred = False
+    conf.Models.WorldModel.vit_model_name = 'samvit_base_patch16'
+    conf.Models.WorldModel.vit_use_pretrained = True
+    conf.Models.WorldModel.vit_freeze = True
+    conf.Models.WorldModel.vit_feature_level = 12
+    conf.Models.WorldModel.use_onehot = True
+    conf.Models.WorldModel.transformer_layer = CN()
+
+    
+    conf.Models.WorldModel.transformer_layer.embed_dim = 256
+    conf.Models.WorldModel.transformer_layer.feedforward_dim = 1024
+    conf.Models.WorldModel.transformer_layer.head_dim = 64
+    conf.Models.WorldModel.transformer_layer.num_heads = 4
+    conf.Models.WorldModel.transformer_layer.activation = 'silu' 
+    conf.Models.WorldModel.transformer_layer.dropout_p = 0.1
+    conf.Models.WorldModel.transformer_layer.layer_norm_eps = 1e-5
+
+    conf.Models.Decoder = CN()
+    conf.Models.Decoder.resolution = 224
+    conf.Models.Decoder.dec_input_dim = 128
+    conf.Models.Decoder.dec_hidden_dim = 64
+    conf.Models.Decoder.out_ch = 4
+    conf.Models.Decoder.vit_num_patches = 196 # res 224
+    conf.Models.Decoder.dec_hidden_layers = [1024, 1024, 1024] # MLPDecoder
+    conf.Models.Decoder.dec_output_dim = 768 # MLPDecoder
+
+    conf.Models.Slot_attn = CN()
+    conf.Models.Slot_attn.num_slots = 7 # num_tokens = num_slots * tokens_per_slot
+    conf.Models.Slot_attn.tokens_per_slot = 1
+    conf.Models.Slot_attn.iters = 3
+    conf.Models.Slot_attn.channels_enc = 128
+    conf.Models.Slot_attn.token_dim = 128 # need to match embed_dim if no pre_process_conv
+    conf.Models.Slot_attn.prior_class = 'gru'
 
     conf.Models.Agent = CN()
     conf.Models.Agent.NumLayers = 0
