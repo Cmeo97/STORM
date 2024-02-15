@@ -61,7 +61,10 @@ class MultiHeadAttention(nn.Module):
         attn = torch.matmul(q, k.transpose(-1, -2))
         
         if attn_mask is not None:
-            attn = attn.masked_fill(attn_mask, float('-inf'))
+            if attn.dtype == torch.float16:
+                attn = attn.masked_fill(attn_mask == 0, -6e4)
+            else:
+                attn = attn.masked_fill(attn_mask == 0, -1e9)
         
         attn = attn.softmax(dim=-1)
         attn = self.attn_dropout(attn)

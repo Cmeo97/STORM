@@ -105,12 +105,12 @@ class StochasticTransformerKVCache(nn.Module):
 
 class TransformerXL(nn.Module):
 
-    def __init__(self, stoch_dim, action_dim, feat_dim, transformer_layer_config, num_layers, max_length, mem_length, batch_first=True, slot_based=True):
+    def __init__(self, stoch_dim, action_dim, feat_dim, transformer_layer_config, num_layers, max_length, mem_length, conf=None, batch_first=True, slot_based=True):
         super().__init__()
         
         self.action_dim = action_dim
         self.feat_dim = feat_dim
-
+        self.conf = conf
         # mix image_embedding and action
         self.stem = nn.Sequential(
             nn.Linear(stoch_dim+action_dim, feat_dim, bias=False),
@@ -125,6 +125,7 @@ class TransformerXL(nn.Module):
         self.mem_length = mem_length
         self.batch_first = batch_first
         self.slot_based = slot_based
+        self.layer_norm = nn.LayerNorm(feat_dim, eps=1e-6)  # TODO: check if this is necessary
         self.pos_enc = PositionalEncoding(transformer_layer.embed_dim, max_length, dropout_p=transformer_layer.dropout_p)
         self.u_bias = nn.Parameter(torch.Tensor(transformer_layer.num_heads, transformer_layer.head_dim))
         self.v_bias = nn.Parameter(torch.Tensor(transformer_layer.num_heads, transformer_layer.head_dim))
@@ -142,41 +143,39 @@ class TransformerXL(nn.Module):
         else:
             return None
 
-    def forward(self, x, positions, attn_mask, mems=None, tgt_length=None, generation=False):
+    def forward(self, x, action, attn_mask, positions, mems=None, generation=False): 
+        B, T, S, E = x.shape
+        x = rearrange(x, 'B T S E->B (T S) E')
         if self.batch_first:
             x = x.transpose(0, 1)
-
+        
         if mems is None:
             mems = self.init_mems()
 
-        if tgt_length is None:
-            tgt_length = x.shape[0]
-        assert tgt_length > 0
-      
+        action = F.one_hot(action.long(), self.action_dim).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=1).float()
+        if self.batch_first:
+            action = action.transpose(0,1)
+        feats = self.stem(torch.cat([x, action], dim=-1))
+        feats = self.layer_norm(feats)
         pos_enc = self.pos_enc(positions)
-        hiddens = [x]
-        #attentions = []
-        out = x
+        hiddens = [feats]
+        out = feats
         for i, layer in enumerate(self.layers):
             out = layer(out, pos_enc, self.u_bias, self.v_bias, attn_mask=attn_mask, mems=mems[i])
             hiddens.append(out)
-            #attentions.append(attention)
-
-        out = out[-tgt_length:]   #check in the tmw repository dimensionality of out!!
 
         if self.batch_first:
             out = out.transpose(0, 1)
 
-        assert len(hiddens) == len(mems)
-        if generation and self.slot_based:
+        out = rearrange(out, 'B (T S) E->B T S E', T=T)
+        
+        if generation:
             with torch.no_grad():
                 for i in range(len(hiddens)):
                     mems[i] = torch.cat([mems[i], hiddens[i]], dim=0)[-self.mem_length:] 
+            return out, mems
         else:
-            with torch.no_grad():
-                for i in range(len(hiddens)):
-                    mems[i] = torch.cat([mems[i], hiddens[i][0].unsqueeze(0)], dim=0)[-self.mem_length:] 
-        return out, mems
+            return out
 
 
 def get_activation(nonlinearity, param=None):

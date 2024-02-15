@@ -4,23 +4,24 @@ BasicSettings:
   Seed: 0
   ImageSize: 224
   ReplayBufferOnGPU: True
+  dtype: torch.float16
 
 JointTrainAgent:
   SampleMaxSteps: 102000
   BufferMaxLength: 100000
-  BufferWarmUp: 1024
+  BufferWarmUp: 16
   NumEnvs: 1
-  BatchSize: 16
-  DemonstrationBatchSize: 4
-  BatchLength: 16
-  ImagineBatchSize: 1024
-  ImagineDemonstrationBatchSize: 256
-  ImagineContextLength: 8
-  ImagineBatchLength: 16
+  BatchSize: 2
+  DemonstrationBatchSize: 2
+  BatchLength: 2
+  ImagineBatchSize: 16
+  ImagineDemonstrationBatchSize: 2
+  ImagineContextLength: 2
+  ImagineBatchLength: 4
   TrainDynamicsEverySteps: 1
   TrainAgentEverySteps: 1
   UseDemonstration: False
-  SaveEverySteps: 2500
+  SaveEverySteps: 50
 
 Models:
   WorldModel:
@@ -63,7 +64,7 @@ Models:
     wm_batch_size: 100
     wm_sequence_length: 340
     wm_train_steps: 1
-    wm_memory_length: 8
+    wm_memory_length: 21
     wm_discount_threshold: 0.1
     regularization_post_quant: False
     regularization_tokens: False

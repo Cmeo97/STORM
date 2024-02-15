@@ -24,7 +24,7 @@ def calc_lambda_return(rewards, values, termination, gamma, lam, dtype=torch.flo
 
     batch_size, batch_length = rewards.shape[:2]
     # gae_step = torch.zeros((batch_size, ), dtype=dtype, device="cuda")
-    gamma_return = torch.zeros((batch_size, batch_length+1), dtype=dtype, device=device)
+    gamma_return = torch.zeros((batch_size, batch_length+1), dtype=rewards.dtype, device=device)
     gamma_return[:, -1] = values[:, -1]
     for t in reversed(range(batch_length)):  # with last bootstrap
         gamma_return[:, t] = \
@@ -34,17 +34,74 @@ def calc_lambda_return(rewards, values, termination, gamma, lam, dtype=torch.flo
     return gamma_return[:, :-1]
 
 
+class TransformerWithCLS(nn.Module):
+    def __init__(self, in_features, d_model, num_heads, num_layers, norm_first=False):
+        super(TransformerWithCLS, self).__init__()
+        self._linear = nn.Linear(in_features, d_model)
+        self._cls_token = nn.Parameter(torch.zeros(d_model))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model, num_heads,
+            batch_first=True,
+            #norm_first=norm_first
+        )
+        self._trans = nn.TransformerEncoder(encoder_layer, num_layers)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        B, L = state.shape[:2]
+        state = rearrange(state, "B L N D -> (B L) N D")
+
+        state = self._linear(state)
+        state = torch.cat(
+            [self._cls_token.repeat(B*L, 1, 1), state], dim=1
+        )
+        state = rearrange(state, "B N D -> N B D")
+
+        feats = self._trans(state)[0]
+        feats = rearrange(feats, "(B L) D -> B L D", B=B)
+
+        return feats
+    
+
+class MLP(nn.Module):
+    def __init__(self, in_features, d_model):
+        super(MLP, self).__init__()
+        self._linear = nn.Sequential(
+            nn.Linear(in_features, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        B, L = state.shape[:2]
+        state = rearrange(state, "B L N D -> (B L) N D")
+        state = state.sum(dim=1)
+
+        feats = self._linear(state)
+        feats = rearrange(feats, "(B L) D -> B L D", B=B)
+
+        return feats
+
 class ActorCriticAgent(nn.Module):
-    def __init__(self, feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef, device='cuda:0') -> None:
+    def __init__(self, feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef, device='cuda:0', dtype='torch.float16', conf=None) -> None:
         super().__init__()
         self.gamma = gamma
         self.lambd = lambd
         self.entropy_coef = entropy_coef
-        self.use_amp = True
-        self.tensor_dtype = torch.bfloat16 if self.use_amp else torch.float32
+        self.use_amp = True if (dtype == 'torch.float16' or dtype == 'torch.bfloat16') else False
+        self.tensor_dtype = torch.float16 if dtype == 'torch.float16' else torch.bfloat16 if dtype == 'torch.bfloat16' else torch.float32
         self.device = device
         self.symlog_twohot_loss = SymLogTwoHotLoss(255, -20, 20)
 
+        self.conf = conf
+        if self.conf.Models.WorldModel.model == 'OC-irisXL':
+            self.OC_pool_layer = nn.Sequential(
+            nn.Linear(self.conf.Models.Slot_attn.num_slots*feat_dim, feat_dim, bias=False),
+            nn.LayerNorm(feat_dim),
+            nn.ReLU()
+            )
         actor = [
             nn.Linear(feat_dim, hidden_dim, bias=False),
             nn.LayerNorm(hidden_dim),
@@ -91,21 +148,33 @@ class ActorCriticAgent(nn.Module):
             slow_param.data.copy_(slow_param.data * decay + param.data * (1 - decay))
 
     def policy(self, x):
+        if self.conf.Models.WorldModel.model == 'OC-irisXL':
+            x = rearrange(x, 'b t s e->b t (s e)')
+            x = self.OC_pool_layer(x)
         logits = self.actor(x)
         return logits
 
     def value(self, x):
+        if self.conf.Models.WorldModel.model == 'OC-irisXL':
+            x = rearrange(x, 'b t s e->b t (s e)')
+            x = self.OC_pool_layer(x)        
         value = self.critic(x)
         value = self.symlog_twohot_loss.decode(value)
         return value
 
     @torch.no_grad()
     def slow_value(self, x):
+        if self.conf.Models.WorldModel.model == 'OC-irisXL':
+            x = rearrange(x, 'b t s e->b t (s e)')
+            x = self.OC_pool_layer(x)
         value = self.slow_critic(x)
         value = self.symlog_twohot_loss.decode(value)
         return value
 
     def get_logits_raw_value(self, x):
+        if self.conf.Models.WorldModel.model == 'OC-irisXL':
+            x = rearrange(x, 'b t s e->b t (s e)')
+            x = self.OC_pool_layer(x)
         logits = self.actor(x)
         raw_value = self.critic(x)
         return logits, raw_value
@@ -113,7 +182,7 @@ class ActorCriticAgent(nn.Module):
     @torch.no_grad()
     def sample(self, latent, greedy=False):
         self.eval()
-        with torch.autocast(device_type=self.device, dtype=torch.bfloat16, enabled=self.use_amp):
+        with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
             logits = self.policy(latent)
             dist = distributions.Categorical(logits=logits)
             if greedy:
@@ -131,7 +200,7 @@ class ActorCriticAgent(nn.Module):
         Update policy and value model
         '''
         self.train()
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+        with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
             logits, raw_value = self.get_logits_raw_value(latent)
             dist = distributions.Categorical(logits=logits[:, :-1])
             log_prob = dist.log_prob(action)
@@ -175,3 +244,42 @@ class ActorCriticAgent(nn.Module):
             logger.log('ActorCritic/S', S.item())
             logger.log('ActorCritic/norm_ratio', norm_ratio.item())
             logger.log('ActorCritic/total_loss', loss.item())
+
+
+class OCActorCriticAgent(ActorCriticAgent):
+    def __init__(self, feat_dim, num_heads, num_layers, hidden_dim, mlp_hidden_dim, action_dim, gamma, lambd, entropy_coef,
+                 lr, max_grad_norm) -> None:
+        super().__init__(feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef, lr, max_grad_norm)
+
+        shared_transformer = TransformerWithCLS(feat_dim, hidden_dim, num_heads, num_layers)
+        # shared_transformer = MLP(feat_dim, hidden_dim)
+        shared_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_hidden_dim),
+            nn.LayerNorm(mlp_hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(mlp_hidden_dim, mlp_hidden_dim),
+            nn.LayerNorm(mlp_hidden_dim),
+            nn.ReLU(inplace=True)
+        )
+        self.actor = nn.Sequential(
+            shared_transformer,
+            shared_mlp,
+            nn.Linear(mlp_hidden_dim, action_dim)
+        )
+        self.critic = nn.Sequential(
+            shared_transformer,
+            shared_mlp,
+            nn.Linear(mlp_hidden_dim, 255)
+        )
+
+        self.slow_critic = copy.deepcopy(self.critic)
+
+        self.lowerbound_ema = EMAScalar(decay=0.99)
+        self.upperbound_ema = EMAScalar(decay=0.99)
+
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.max_grad_norm, eps=1e-5)
+      
+        # self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=linear_warmup_exp_decay(15000))
+
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+

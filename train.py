@@ -64,7 +64,7 @@ def world_model_imagine_data(replay_buffer: ReplayBuffer,
     sample_obs, sample_action, sample_reward, sample_termination = replay_buffer.sample(
         imagine_batch_size, imagine_demonstration_batch_size, imagine_context_length, device)
     latent, action, reward_hat, termination_hat = world_model.imagine_data(
-        agent, sample_obs, sample_action,
+        agent, sample_obs, sample_action, sample_termination,
         imagine_batch_size=imagine_batch_size+imagine_demonstration_batch_size,
         imagine_batch_length=imagine_batch_length,
         log_video=log_video,
@@ -95,7 +95,11 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
     current_obs, current_info = vec_env.reset()
     context_obs = deque(maxlen=16)
     context_action = deque(maxlen=16)
-
+    context_done = deque(maxlen=16)
+    reward_best = last_reward_best = -100
+    if model_name == 'OC-irisXL':
+        mems = world_model.storm_transformer.init_mems()
+    
     # sample and train
     for total_steps in tqdm(range(max_steps//num_envs)):
         # sample part >>>
@@ -106,17 +110,22 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
                 if len(context_action) == 0:
                     action = vec_env.action_space.sample()
                 else:
+                    model_context_action = np.stack(list(context_action), axis=1)
+                    model_context_action = torch.Tensor(model_context_action).to(device)
                     if model_name == 'OC-irisXL':
-                        context_latent, _, _ = world_model.encode_obs(torch.cat(list(context_obs), dim=1))
+                        slots, context_latent, _, _ = world_model.encode_obs(torch.cat(list(context_obs), dim=1))
+                        prior_flattened_sample, last_dist_feat, mems = world_model.calc_last_dist_feat(context_latent, model_context_action, context_done, mems, device)
                     else:
                         context_latent = world_model.encode_obs(torch.cat(list(context_obs), dim=1))
-                    model_context_action = np.stack(list(context_action), axis=1)
-                    model_context_action = torch.Tensor(model_context_action).to()
-                    prior_flattened_sample, last_dist_feat = world_model.calc_last_dist_feat(context_latent, model_context_action)
+                        prior_flattened_sample, last_dist_feat = world_model.calc_last_dist_feat(context_latent, model_context_action)
+                    
                     action = agent.sample_as_env_action(
                         torch.cat([prior_flattened_sample, last_dist_feat], dim=-1),
                         greedy=False
                     )
+
+            if len(context_obs) < 16:
+                mems = world_model.storm_transformer.init_mems()
 
             context_obs.append(rearrange(torch.Tensor(current_obs).to(device), "B H W C -> B 1 C H W")/255)
             context_action.append(action)
@@ -124,9 +133,16 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
             action = vec_env.action_space.sample()
 
         obs, reward, done, truncated, info = vec_env.step(action)
-        replay_buffer.append(current_obs, action, reward, np.logical_or(done, info["life_loss"]))
+        
+        reward_best = reward if reward > reward_best else reward_best
 
         done_flag = np.logical_or(done, truncated)
+        if replay_buffer.ready():
+            context_done.append(done)
+
+        replay_buffer.append(current_obs, action, reward, np.logical_or(done, info["life_loss"]))
+
+        
         if done_flag.any():
             for i in range(num_envs):
                 if done_flag[i]:
@@ -188,8 +204,12 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
         # save model per episode
         if total_steps % (save_every_steps//num_envs) == 0:
             print(colorama.Fore.GREEN + f"Saving model at total steps {total_steps}" + colorama.Style.RESET_ALL)
-            torch.save(world_model.state_dict(), f"ckpt/{args.n}/world_model_{total_steps}.pth")
-            torch.save(agent.state_dict(), f"ckpt/{args.n}/agent_{total_steps}.pth")
+            torch.save(world_model.state_dict(), f"ckpt/{args.n}/world_model_last.pth")
+            torch.save(agent.state_dict(), f"ckpt/{args.n}/agent_last.pth")
+            if last_reward_best != reward_best:
+                torch.save(world_model.state_dict(), f"ckpt/{args.n}/world_model_best.pth")
+                torch.save(agent.state_dict(), f"ckpt/{args.n}/agent_best.pth")
+                last_reward_best = reward_best
 
 
 def build_world_model(conf, action_dim, device):
@@ -218,6 +238,7 @@ def build_world_model(conf, action_dim, device):
 
 
 def build_agent(conf, action_dim, device):
+    
     return agents.ActorCriticAgent(
         feat_dim=32*32+conf.Models.WorldModel.TransformerHiddenDim,
         num_layers=conf.Models.Agent.NumLayers,
@@ -226,6 +247,9 @@ def build_agent(conf, action_dim, device):
         gamma=conf.Models.Agent.Gamma,
         lambd=conf.Models.Agent.Lambda,
         entropy_coef=conf.Models.Agent.EntropyCoef,
+        device=device, 
+        dtype=conf.BasicSettings.dtype,
+        conf=conf
     ).to(device)
 
 
