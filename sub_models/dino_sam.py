@@ -552,7 +552,7 @@ class SpatialBroadcastDecoder(nn.Module):
         super().__init__()
         
         hidden_dim = dec_hidden_dim
-        resolution = resolution
+        out_resolution = resolution
 
         if hidden_dim == 64:
             self.layers = nn.Sequential(
@@ -584,8 +584,8 @@ class SpatialBroadcastDecoder(nn.Module):
             )
         if isinstance(resolution, int):
             resolution = (resolution, resolution)
-        # self.init_resolution = resolution if hidden_dim == 32 else (8, 8)
-        self.init_resolution = resolution if hidden_dim == 32 else (28, 28)
+        self.init_resolution = (28, 28) if out_resolution == 224 else (8, 8)
+        #self.init_resolution = resolution if hidden_dim == 32 else (28, 28)
         self.pos_embedding = PositionalEmbedding(self.init_resolution, dec_input_dim)
         self.resolution = resolution
         self._init_params()
@@ -603,7 +603,7 @@ class SpatialBroadcastDecoder(nn.Module):
     def __repr__(self) -> str:
         return "image_decoder"
     
-    def forward(self, x: torch.Tensor, return_indiv_slots=False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         bs = x.shape[0]
         K = x.shape[1] # number of slots
         x = self.spatial_broadcast(x.permute(0,1,3,2))
@@ -617,10 +617,9 @@ class SpatialBroadcastDecoder(nn.Module):
         masks = masks.softmax(dim=1)
         rec = (colors * masks).sum(dim=1)
 
-        if return_indiv_slots:
-            return rec, colors, masks
+        return rec, colors, masks
 
-        return rec
+      
 
     def spatial_broadcast(self, slot: torch.Tensor) -> torch.Tensor:
         slot = slot.reshape(-1, slot.shape[-1])

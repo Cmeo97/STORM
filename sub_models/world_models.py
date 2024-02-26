@@ -5,7 +5,7 @@ from torch.distributions import OneHotCategorical, Normal
 from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 from torch.cuda.amp import autocast
-
+from torchvision.transforms import Resize
 from sub_models.functions_losses import SymLogTwoHotLoss
 from sub_models.attention_blocks import get_subsequent_mask_with_batch_length, get_subsequent_mask, get_causal_mask
 from sub_models.transformer_model import StochasticTransformerKVCache, TransformerXL
@@ -321,6 +321,9 @@ class WorldModel(nn.Module):
                 transformer_hidden_dim=transformer_hidden_dim
             )
 
+            self.downsample = Resize(size=(conf.Models.Decoder.resolution, conf.Models.Decoder.resolution))
+     
+
         else:
             self.encoder = EncoderBN(
                 in_channels=in_channels,
@@ -433,10 +436,10 @@ class WorldModel(nn.Module):
             prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
             prior_flattened_sample = self.flatten_sample(prior_sample)
             if log_video:
-                slots_hat = self.slots_head(dist_feat).permute(0,2,3,1)
-                obs_hat = self.image_decoder(slots_hat)
+                slots_hat = self.slots_head(dist_feat[:8]).permute(0,2,3,1)
+                output_hat = self.image_decoder(slots_hat)
             else:
-                obs_hat = None
+                output_hat = None
             
             if self.conf.Models.WorldModel.model=='OC-irisXL':
                 combined_dist_feat = self.OC_pool_layer(rearrange(dist_feat, 'b t s e-> b t (s e)'))
@@ -450,7 +453,7 @@ class WorldModel(nn.Module):
                 termination_hat = self.termination_decoder(dist_feat)
                 termination_hat = termination_hat > 0
   
-        return obs_hat, reward_hat, termination_hat, prior_flattened_sample, dist_feat, mems
+        return output_hat, reward_hat, termination_hat, prior_flattened_sample, dist_feat, mems
 
     def stright_throught_gradient(self, logits, sample_mode="random_sample"):
         dist = OneHotCategorical(logits=logits)
@@ -468,6 +471,49 @@ class WorldModel(nn.Module):
         else:
             sample = rearrange(sample, "B L K C -> B L (K C)")
         return sample
+
+    #@torch.no_grad()
+    #def inspect_world_model_predictions(self, obs, obs_hat, colors=None, masks=None):
+    #    
+    #    b, t, _, h, w = obs.size()
+    #    plots = []
+    #    for i in range(b):
+    #        obs = obs[i].cpu() # (t c h w)
+    #        recon = obs_hat[i].cpu() # (t c h w)
+    #        full_plot = torch.cat([obs.unsqueeze(1), recon.unsqueeze(1)], dim=1) # (t 2 c h w)
+    #        color = colors[i].cpu()
+    #        mask = masks[i].repeat(1,1,3,1,1).cpu()
+    #        subimage = color * mask
+    #        full_plot = torch.cat([full_plot, mask, subimage], dim=1) #(T,2+K+K,3,D,D)
+    #        full_plot = full_plot.permute(1, 0, 2, 3, 4).contiguous()  # (H,W,3,D,D)
+    #        full_plot = full_plot.view(-1, 1, 3, h, w)  # (H*W, 3, D, D)
+    #        plots.append(full_plot)
+    #    
+    #    return plots
+    
+    def compute_image_with_slots(self, obs, recons, colors=None, masks=None):
+        b, t, _, h, w = obs.size()
+        plots = []
+   
+        obs, recons, colors, masks = obs.cpu(), recons.cpu(), colors.cpu(), masks.cpu()
+
+        for i in range(int(b/4 + 1)):
+            ob = obs[i] # (t c h w)
+            recon = recons[i] # (t c h w)
+            full_plot = torch.cat([ob.unsqueeze(1), recon.unsqueeze(1)], dim=1) # (t 2 c h w)
+            color = colors[i]
+            mask = masks[i]
+            subimage = color * mask
+            mask = mask.repeat(1,1,3,1,1)
+            full_plot = torch.cat([full_plot, mask, subimage], dim=1) #(T,2+K+K,3,D,D)
+            full_plot = full_plot.permute(1, 0, 2, 3, 4).contiguous()  # (H,W,3,D,D)
+            full_plot = full_plot.view(-1, 1, 3, h, w)  # (H*W, 3, D, D)
+            plots.append(full_plot)
+
+        return plots
+
+       
+        
 
     def init_imagine_buffer(self, imagine_batch_size, imagine_batch_length, dtype, device):
         '''
@@ -494,7 +540,10 @@ class WorldModel(nn.Module):
     def imagine_data(self, agent: agents.ActorCriticAgent, sample_obs, sample_action, sample_termination,
                      imagine_batch_size, imagine_batch_length, log_video, logger, device):
         self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype, device=device)
-        obs_hat_list = []
+        obs_hat_list, colors_hat_list, masks_hat_list = [], [], []
+        if log_video:
+            sample_obs, obs_gt = torch.chunk(sample_obs, 2, 1)
+       
         if isinstance(self.storm_transformer, StochasticTransformerKVCache):
             self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype, device=device)
         # context
@@ -505,6 +554,7 @@ class WorldModel(nn.Module):
             context_latent = self.encode_obs(sample_obs)
             mems = None
         
+
         for i in range(sample_obs.shape[1]):  # context_length is sample_obs.shape[1]
             last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat, mems = self.predict_next(
                 context_latent[:, i:i+1],
@@ -530,14 +580,23 @@ class WorldModel(nn.Module):
             self.reward_hat_buffer[:, i:i+1] = last_reward_hat
             self.termination_hat_buffer[:, i:i+1] = last_termination_hat
             if log_video:
+                last_obs_hat, last_colors_hat, last_masks_hat = last_obs_hat
                 obs_hat_list.append(last_obs_hat[::imagine_batch_size//16].unsqueeze(1))  # uniform sample vec_env
+                colors_hat_list.append(last_colors_hat[::imagine_batch_size//16].unsqueeze(1)) 
+                masks_hat_list.append(last_masks_hat[::imagine_batch_size//16].unsqueeze(1)) 
 
+        
         if log_video:
-            logger.log("Imagine/predict_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
+            obs_hat = torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1)
+            obs_downsampled = self.downsample(rearrange(obs_gt[:obs_hat_list[0].shape[0]], 'b t c h w->(b t c) h w')).view(*obs_hat.shape)
+            colors_hat, masks_hat = torch.cat(colors_hat_list, dim=1), torch.cat(masks_hat_list, dim=1)
+            logger.log("Imagine/predict_video", obs_hat.cpu().float().detach().numpy())
+            obs_hat_list = self.compute_image_with_slots(obs_downsampled, obs_hat, colors_hat, masks_hat)
+            logger.log("Imagine/predict_slots_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
 
         return torch.cat([self.latent_buffer, self.hidden_buffer], dim=-1), self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer
 
-    def update(self, obs, action, reward, termination, logger=None):
+    def update(self, obs, action, reward, termination, logger=None, log_recs=False):
         self.train()
         batch_size, batch_length = obs.shape[:2]
 
@@ -557,9 +616,9 @@ class WorldModel(nn.Module):
             sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
             
             flattened_sample = self.flatten_sample(sample) if self.conf.Models.WorldModel.use_onehot else embedding.detach()
-
+            flattened_sample = flattened_sample.detach() if self.conf.Models.WorldModel.independent_modules else flattened_sample
             # decoding image
-            obs_hat = self.image_decoder(rearrange(embedding, 'B T S E-> (B T) S E').unsqueeze(-1).detach()) if self.conf.Models.WorldModel.model=='OC-irisXL' else self.image_decoder(flattened_sample)
+            obs_hat, colors, masks = self.image_decoder(rearrange(embedding, 'B T S E-> (B T) S E').unsqueeze(-1).detach()) if self.conf.Models.WorldModel.model=='OC-irisXL' else self.image_decoder(flattened_sample)
             
             # transformer
             temporal_mask = get_causal_mask(src_length, tgt_length, embedding.device, termination, self.conf.Models.Slot_attn.num_slots) if self.conf.Models.WorldModel.model == 'OC-irisXL' else get_subsequent_mask_with_batch_length(batch_length, flattened_sample.device)
@@ -579,14 +638,15 @@ class WorldModel(nn.Module):
             consistency_loss = self.dino.cosine_loss(embedding) if self.conf.Models.WorldModel.model == 'OC-irisXL' else 0
             dino_reconstruction_loss = torch.pow(z_vit - reconstructions, 2).mean() if self.conf.Models.WorldModel.model == 'OC-irisXL' else 0
             # STORM env losses
-            reconstruction_loss = self.mse_loss_func(obs_hat.reshape(-1, *obs.shape[1:]), obs.mul(2).sub(1)) + dino_reconstruction_loss + consistency_loss if self.conf.Models.WorldModel.model == 'OC-irisXL' else self.mse_loss_func(obs_hat, obs)
+            decoder_loss = self.mse_loss_func(rearrange(obs_hat, 'b c h w->(b c) h w').unsqueeze(0).unsqueeze(0), self.downsample(rearrange(obs, 'b t c h w->(b t c) h w').mul(2).sub(1)).unsqueeze(0).unsqueeze(0))
+            dino_loss = dino_reconstruction_loss + consistency_loss if self.conf.Models.WorldModel.model == 'OC-irisXL' else self.mse_loss_func(obs_hat, obs)
             reward_loss = self.symlog_twohot_loss_func(reward_hat, reward)
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
             slots_loss = F.mse_loss(embedding.detach(), slots_hat)
             # dyn-rep loss
             dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]).detach(), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]))
             representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]).detach())
-            total_loss = reconstruction_loss + reward_loss + slots_loss + termination_loss + 0.5*dynamics_loss + 0.1*representation_loss
+            total_loss = dino_loss + decoder_loss + reward_loss + slots_loss + termination_loss + 0.5*dynamics_loss + 0.1*representation_loss
 
         # gradient descent
         self.scaler.scale(total_loss).backward()
@@ -599,7 +659,7 @@ class WorldModel(nn.Module):
         if logger is not None:
             logger.log("WorldModel/consistency_loss", consistency_loss.item())
             logger.log("WorldModel/dino_reconstruction_loss", dino_reconstruction_loss.item())
-            logger.log("WorldModel/reconstruction_loss", reconstruction_loss.item())
+            logger.log("WorldModel/decoder_reconstruction_loss", decoder_loss.item())
             logger.log("WorldModel/reward_loss", reward_loss.item())
             logger.log("WorldModel/slots_loss", slots_loss.item())
             logger.log("WorldModel/termination_loss", termination_loss.item())
@@ -608,7 +668,12 @@ class WorldModel(nn.Module):
             logger.log("WorldModel/representation_loss", representation_loss.item())
             logger.log("WorldModel/representation_real_kl_div", representation_real_kl_div.item())
             logger.log("WorldModel/total_loss", total_loss.item())
-
+            if log_recs:
+                #logger.log("WorldModel/predict_slots_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
+                obs_hat = obs_hat.view(obs.shape[0], -1, *obs_hat.shape[1:])
+                obs_downsampled = self.downsample(rearrange(obs, 'b t c h w->(b t c) h w').mul(2).sub(1)).view(*obs_hat.shape)
+                obs_hat_list = self.compute_image_with_slots(obs_downsampled, obs_hat, rearrange(colors, '(b t) s c h w->b t s c h w', b=obs.shape[0]) , rearrange(masks, '(b t) s c h w->b t s c h w', b=obs.shape[0]))
+                logger.log("DINO/video/predict_slots_recs", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
 
     def vit_encode(self, x: torch.Tensor) -> torch.Tensor:
         def _transformer_compute_positions(features):
@@ -653,7 +718,7 @@ class WorldModel(nn.Module):
     def dino_encode(self, x: torch.Tensor):
     
         shape = x.shape  # (..., C, H, W)
-        x = x.view(-1, *shape[-3:])
+        x = x.reshape(-1, *shape[-3:])
         z, _ = self.vit_encode(x)
         z = self.dino.pos_embed(z)
   
@@ -674,3 +739,24 @@ class WorldModel(nn.Module):
         z_vit = z_vit.reshape(*shape[:-3], *z_vit.shape[1:])
   
         return z, inits, z_vit
+    
+    @torch.no_grad()
+    def compute_image_with_slots(self, obs, recons, colors, masks):
+        b, t, _, h, w = obs.size()
+        plots = []
+        obs, colors, masks = obs.cpu(), colors.cpu(), masks.cpu()
+        recons = recons.cpu() if torch.is_tensor(recons) else recons
+        for i in range(int(b/4 + 1)):
+            ob = obs[i] # (t c h w)
+            recon = recons[i] # (t c h w)
+            full_plot = torch.cat([ob.unsqueeze(1), recon.unsqueeze(1)], dim=1) # (t 2 c h w)
+            color = colors[i]
+            mask = masks[i]
+            subimage = color * mask
+            mask = mask.repeat(1,1,3,1,1)
+            full_plot = torch.cat([full_plot, mask, subimage], dim=1) #(T,2+K+K,3,D,D)
+            full_plot = full_plot.permute(1, 0, 2, 3, 4).contiguous()  # (H,W,3,D,D)
+            full_plot = full_plot.view(-1, 1, 3, h, w)  # (H*W, 3, D, D)
+            plots.append(full_plot)
+
+        return plots

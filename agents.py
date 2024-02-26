@@ -18,7 +18,7 @@ def percentile(x, percentage):
     return per
 
 
-def calc_lambda_return(rewards, values, termination, gamma, lam, dtype=torch.float32, device='cuda:0'):
+def calc_lambda_return(rewards, values, termination, gamma, lam, device='cuda:0'):
     # Invert termination to have 0 if the episode ended and 1 otherwise
     inv_termination = (termination * -1) + 1
 

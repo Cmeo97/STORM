@@ -44,9 +44,9 @@ def build_vec_env(env_name, image_size, num_envs, seed):
     return vec_env
 
 
-def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel, batch_size, demonstration_batch_size, batch_length, logger, device):
+def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel, batch_size, demonstration_batch_size, batch_length, logger, device, log_recs):
     obs, action, reward, termination = replay_buffer.sample(batch_size, demonstration_batch_size, batch_length, device)
-    world_model.update(obs, action, reward, termination, logger=logger)
+    world_model.update(obs, action, reward, termination, logger=logger, log_recs=log_recs)
 
 
 @torch.no_grad()
@@ -61,8 +61,13 @@ def world_model_imagine_data(replay_buffer: ReplayBuffer,
     world_model.eval()
     agent.eval()
 
-    sample_obs, sample_action, sample_reward, sample_termination = replay_buffer.sample(
-        imagine_batch_size, imagine_demonstration_batch_size, imagine_context_length, device)
+    if log_video:
+        sample_obs, sample_action, sample_reward, sample_termination = replay_buffer.sample(
+            imagine_batch_size, imagine_demonstration_batch_size, imagine_context_length*2, device)
+    else:
+        sample_obs, sample_action, sample_reward, sample_termination = replay_buffer.sample(
+            imagine_batch_size, imagine_demonstration_batch_size, imagine_context_length, device)
+        
     latent, action, reward_hat, termination_hat = world_model.imagine_data(
         agent, sample_obs, sample_action, sample_termination,
         imagine_batch_size=imagine_batch_size+imagine_demonstration_batch_size,
@@ -71,6 +76,8 @@ def world_model_imagine_data(replay_buffer: ReplayBuffer,
         logger=logger,
         device=device
     )
+
+
     return latent, action, None, None, reward_hat, termination_hat
 
 
@@ -159,6 +166,7 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
 
         # train world model part >>>
         if replay_buffer.ready() and total_steps % (train_dynamics_every_steps//num_envs) == 0:
+            log_recs = True if total_steps % (save_every_steps//num_envs) == 0 else False
             train_world_model_step(
                 replay_buffer=replay_buffer,
                 world_model=world_model,
@@ -166,16 +174,15 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
                 demonstration_batch_size=demonstration_batch_size,
                 batch_length=batch_length,
                 logger=logger,
-                device=device
+                device=device,
+                log_recs=log_recs
             )
         # <<< train world model part
 
         # train agent part >>>
-        if replay_buffer.ready() and total_steps % (train_agent_every_steps//num_envs) == 0 and total_steps*num_envs >= 0:
-            if total_steps % (save_every_steps//num_envs) == 0:
-                log_video = True
-            else:
-                log_video = False
+        if replay_buffer.ready() and total_steps % (train_agent_every_steps//num_envs) == 0 and total_steps*num_envs >= 0 and total_steps > 22000:
+            
+            log_video = True if total_steps % (save_every_steps//num_envs) == 0 else False
 
             imagine_latent, agent_action, agent_logprob, agent_value, imagine_reward, imagine_termination = world_model_imagine_data(
                 replay_buffer=replay_buffer,

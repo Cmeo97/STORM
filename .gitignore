@@ -1,4 +1,6 @@
+logs/
 launch.json
 *.pth
 *.pyc
 *.quechua1
+runs/

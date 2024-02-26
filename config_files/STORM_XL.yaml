@@ -9,26 +9,26 @@ BasicSettings:
 JointTrainAgent:
   SampleMaxSteps: 102000
   BufferMaxLength: 100000
-  BufferWarmUp: 16
+  BufferWarmUp: 1024
   NumEnvs: 1
-  BatchSize: 2
-  DemonstrationBatchSize: 2
-  BatchLength: 2
+  BatchSize: 16
+  DemonstrationBatchSize: 4
+  BatchLength: 16
   ImagineBatchSize: 16
-  ImagineDemonstrationBatchSize: 2
-  ImagineContextLength: 2
-  ImagineBatchLength: 4
+  ImagineDemonstrationBatchSize: 256
+  ImagineContextLength: 16
+  ImagineBatchLength: 16
   TrainDynamicsEverySteps: 1
   TrainAgentEverySteps: 1
   UseDemonstration: False
-  SaveEverySteps: 50
+  SaveEverySteps: 3000
 
 Models:
   WorldModel:
     InChannels: 3
     TransformerMaxLength: 341 # (sequence length + 1)
     TransformerHiddenDim: 512
-    TransformerNumLayers: 2
+    TransformerNumLayers: 4
     TransformerNumHeads: 8
     Transformer: TransformerXL
     tokens_per_block: 8  #17
@@ -78,6 +78,7 @@ Models:
     vit_freeze: True
     vit_feature_level: 12
     use_onehot: True
+    independent_modules: True
 
     transformer_layer:
       embed_dim: 512
@@ -89,7 +90,7 @@ Models:
       layer_norm_eps: 1e-5
 
   Decoder:
-    resolution: 224
+    resolution: 64
     dec_input_dim: 128
     dec_hidden_dim: 64
     out_ch: 4

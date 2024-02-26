@@ -126,6 +126,7 @@ def load_config(config_path):
     conf.Models.WorldModel.vit_feature_level = 12
     conf.Models.WorldModel.use_onehot = True
     conf.Models.WorldModel.transformer_layer = CN()
+    conf.Models.WorldModel.independent_modules = True
 
     
     conf.Models.WorldModel.transformer_layer.embed_dim = 256
