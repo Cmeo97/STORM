@@ -131,7 +131,7 @@ class DistHead(nn.Module):
         # uniform noise mixing
         probs = F.softmax(logits, dim=-1)
         mixed_probs = mixing_ratio * torch.ones_like(probs) / self.stoch_dim + (1-mixing_ratio) * probs
-        logits = torch.log(mixed_probs)
+        logits = torch.log(mixed_probs + 1e-6)
         return logits
 
     def forward_post(self, x):
@@ -163,21 +163,12 @@ class OCDistHead(nn.Module):
         self.post_head = nn.Linear(image_feat_dim, stoch_dim*stoch_dim)
         self.prior_head = nn.Linear(transformer_hidden_dim, stoch_dim*stoch_dim)
 
-    def unimix(self, logits, mixing_ratio=0.01):
-        # uniform noise mixing
-        probs = F.softmax(logits, dim=-1)
-        mixed_probs = mixing_ratio * torch.ones_like(probs) / self.stoch_dim + (1-mixing_ratio) * probs
-        logits = torch.log(mixed_probs)
-        return logits
-
     def forward_post(self, x):
         logits = self.post_head(x)
-        logits = self.unimix(logits)
         return logits
 
-    def forward_prior(self, x):
+    def forward_prior(self, x, generation=False):
         logits = self.prior_head(x)
-        logits = self.unimix(logits)
         return logits
 
 
@@ -268,12 +259,11 @@ class CategoricalKLDivLossWithFreeBits(nn.Module):
 
 
 class WorldModel(nn.Module):
-    def __init__(self, in_channels, action_dim,
-                 transformer_max_length, transformer_hidden_dim, transformer_num_layers, transformer_num_heads, conf):
+    def __init__(self, in_channels, action_dim, transformer_max_length, transformer_hidden_dim, transformer_num_layers, transformer_num_heads, conf):
         super().__init__()
         self.transformer_hidden_dim = transformer_hidden_dim
         self.final_feature_width = 4
-        self.stoch_dim = 32
+        self.stoch_dim = conf.Models.WorldModel.stochastic_dim
         self.stoch_flattened_dim = self.stoch_dim*self.stoch_dim
         dtype = conf.BasicSettings.dtype
         self.use_amp = True if (dtype == 'torch.float16' or dtype == 'torch.bfloat16') else False
@@ -304,11 +294,19 @@ class WorldModel(nn.Module):
                 dec_hidden_dim=conf.Models.Decoder.dec_hidden_dim,
                 out_ch=conf.Models.Decoder.out_ch
             )
-            self.dist_head = DistHead(
-                image_feat_dim=conf.Models.Slot_attn.token_dim,
-                transformer_hidden_dim=transformer_hidden_dim,
-                stoch_dim=self.stoch_dim
-            )
+            if conf.Models.WorldModel.stochastic_head:
+                self.dist_head = DistHead(
+                    image_feat_dim=conf.Models.Slot_attn.token_dim,
+                    transformer_hidden_dim=transformer_hidden_dim,
+                    stoch_dim=self.stoch_dim
+                )
+            else:
+                self.dist_head = OCDistHead(
+                    image_feat_dim=conf.Models.Slot_attn.token_dim,
+                    transformer_hidden_dim=transformer_hidden_dim,
+                    stoch_dim=self.stoch_dim
+                )
+
 
             self.OC_pool_layer = nn.Sequential(
             nn.Linear(self.conf.Models.Slot_attn.num_slots*transformer_hidden_dim, transformer_hidden_dim, bias=False),
@@ -376,7 +374,7 @@ class WorldModel(nn.Module):
             with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
                 slots, inits, z_vit = self.dino_encode(obs) 
                 post_logits = self.dist_head.forward_post(slots)
-                sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
+                sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample") if self.conf.Models.WorldModel.stochastic_head else post_logits
                 return slots, sample, inits, z_vit
         else:
             with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
@@ -398,7 +396,7 @@ class WorldModel(nn.Module):
             if isinstance(self.storm_transformer, StochasticTransformerKVCache):
                 temporal_mask = get_subsequent_mask(latent)
                 dist_feat = self.storm_transformer(latent, action, temporal_mask)
-                prior_logits = self.dist_head.forward_prior(dist_feat[:, -1:])
+                prior_logits = self.dist_head.forward_prior(dist_feat[:, -1:]) 
                 prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
                 prior_flattened_sample = self.flatten_sample(prior_sample)
                 return prior_flattened_sample, dist_feat[:, -1:]
@@ -412,9 +410,8 @@ class WorldModel(nn.Module):
                     latent = rearrange(latent, 'b t s e E->b t s (e E)')
                 dist_feat, mems = self.storm_transformer(latent, action, temporal_mask, positions, mems, generation=True)
                 prior_logits = self.dist_head.forward_prior(dist_feat[:, -1:], generation=True)
-
-                prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
-                prior_flattened_sample = self.flatten_sample(prior_sample)
+                prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample") if self.conf.Models.WorldModel.stochastic_head else prior_logits
+                prior_flattened_sample = self.flatten_sample(prior_sample) if self.conf.Models.WorldModel.stochastic_head else prior_sample
                 return prior_flattened_sample, dist_feat[:, -1:], mems
 
     def predict_next(self, last_flattened_sample, action, termination, log_video=True, mems=None, device=None):
@@ -433,8 +430,12 @@ class WorldModel(nn.Module):
             prior_logits = self.dist_head.forward_prior(dist_feat, generation=True)
 
             # decoding
-            prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
-            prior_flattened_sample = self.flatten_sample(prior_sample)
+            if self.conf.Models.WorldModel.stochastic_head:
+                prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
+                prior_flattened_sample = self.flatten_sample(prior_sample)
+            else:
+                prior_flattened_sample = prior_logits
+        
             if log_video:
                 slots_hat = self.slots_head(dist_feat[:8]).permute(0,2,3,1)
                 output_hat = self.image_decoder(slots_hat)
@@ -471,49 +472,6 @@ class WorldModel(nn.Module):
         else:
             sample = rearrange(sample, "B L K C -> B L (K C)")
         return sample
-
-    #@torch.no_grad()
-    #def inspect_world_model_predictions(self, obs, obs_hat, colors=None, masks=None):
-    #    
-    #    b, t, _, h, w = obs.size()
-    #    plots = []
-    #    for i in range(b):
-    #        obs = obs[i].cpu() # (t c h w)
-    #        recon = obs_hat[i].cpu() # (t c h w)
-    #        full_plot = torch.cat([obs.unsqueeze(1), recon.unsqueeze(1)], dim=1) # (t 2 c h w)
-    #        color = colors[i].cpu()
-    #        mask = masks[i].repeat(1,1,3,1,1).cpu()
-    #        subimage = color * mask
-    #        full_plot = torch.cat([full_plot, mask, subimage], dim=1) #(T,2+K+K,3,D,D)
-    #        full_plot = full_plot.permute(1, 0, 2, 3, 4).contiguous()  # (H,W,3,D,D)
-    #        full_plot = full_plot.view(-1, 1, 3, h, w)  # (H*W, 3, D, D)
-    #        plots.append(full_plot)
-    #    
-    #    return plots
-    
-    def compute_image_with_slots(self, obs, recons, colors=None, masks=None):
-        b, t, _, h, w = obs.size()
-        plots = []
-   
-        obs, recons, colors, masks = obs.cpu(), recons.cpu(), colors.cpu(), masks.cpu()
-
-        for i in range(int(b/4 + 1)):
-            ob = obs[i] # (t c h w)
-            recon = recons[i] # (t c h w)
-            full_plot = torch.cat([ob.unsqueeze(1), recon.unsqueeze(1)], dim=1) # (t 2 c h w)
-            color = colors[i]
-            mask = masks[i]
-            subimage = color * mask
-            mask = mask.repeat(1,1,3,1,1)
-            full_plot = torch.cat([full_plot, mask, subimage], dim=1) #(T,2+K+K,3,D,D)
-            full_plot = full_plot.permute(1, 0, 2, 3, 4).contiguous()  # (H,W,3,D,D)
-            full_plot = full_plot.view(-1, 1, 3, h, w)  # (H*W, 3, D, D)
-            plots.append(full_plot)
-
-        return plots
-
-       
-        
 
     def init_imagine_buffer(self, imagine_batch_size, imagine_batch_length, dtype, device):
         '''
@@ -612,10 +570,12 @@ class WorldModel(nn.Module):
             else:
                 embedding = self.encoder(obs)
                 
+               
             post_logits = self.dist_head.forward_post(embedding)
-            sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
+            if self.conf.Models.WorldModel.stochastic_head:
+                sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
             
-            flattened_sample = self.flatten_sample(sample) if self.conf.Models.WorldModel.use_onehot else embedding.detach()
+            flattened_sample = self.flatten_sample(sample) if self.conf.Models.WorldModel.stochastic_head else post_logits.detach()
             flattened_sample = flattened_sample.detach() if self.conf.Models.WorldModel.independent_modules else flattened_sample
             # decoding image
             obs_hat, colors, masks = self.image_decoder(rearrange(embedding, 'B T S E-> (B T) S E').unsqueeze(-1).detach()) if self.conf.Models.WorldModel.model=='OC-irisXL' else self.image_decoder(flattened_sample)
@@ -644,9 +604,12 @@ class WorldModel(nn.Module):
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
             slots_loss = F.mse_loss(embedding.detach(), slots_hat)
             # dyn-rep loss
-            dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]).detach(), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]))
-            representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]).detach())
-            total_loss = dino_loss + decoder_loss + reward_loss + slots_loss + termination_loss + 0.5*dynamics_loss + 0.1*representation_loss
+            total_loss = dino_loss + decoder_loss + reward_loss + slots_loss + termination_loss 
+            if self.conf.Models.WorldModel.stochastic_head:
+                dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]).detach(), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]))
+                representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]).detach())
+                total_loss += 0.5*dynamics_loss + 0.1*representation_loss
+            
 
         # gradient descent
         self.scaler.scale(total_loss).backward()
@@ -663,10 +626,11 @@ class WorldModel(nn.Module):
             logger.log("WorldModel/reward_loss", reward_loss.item())
             logger.log("WorldModel/slots_loss", slots_loss.item())
             logger.log("WorldModel/termination_loss", termination_loss.item())
-            logger.log("WorldModel/dynamics_loss", dynamics_loss.item())
-            logger.log("WorldModel/dynamics_real_kl_div", dynamics_real_kl_div.item())
-            logger.log("WorldModel/representation_loss", representation_loss.item())
-            logger.log("WorldModel/representation_real_kl_div", representation_real_kl_div.item())
+            if self.conf.Models.WorldModel.stochastic_head:
+                logger.log("WorldModel/dynamics_loss", dynamics_loss.item())
+                logger.log("WorldModel/dynamics_real_kl_div", dynamics_real_kl_div.item())
+                logger.log("WorldModel/representation_loss", representation_loss.item())
+                logger.log("WorldModel/representation_real_kl_div", representation_real_kl_div.item())
             logger.log("WorldModel/total_loss", total_loss.item())
             if log_recs:
                 #logger.log("WorldModel/predict_slots_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
@@ -746,12 +710,12 @@ class WorldModel(nn.Module):
         plots = []
         obs, colors, masks = obs.cpu(), colors.cpu(), masks.cpu()
         recons = recons.cpu() if torch.is_tensor(recons) else recons
-        for i in range(int(b/4 + 1)):
+        for i in range(1):
             ob = obs[i] # (t c h w)
             recon = recons[i] # (t c h w)
             full_plot = torch.cat([ob.unsqueeze(1), recon.unsqueeze(1)], dim=1) # (t 2 c h w)
-            color = colors[i]
-            mask = masks[i]
+            color = colors[i].float() 
+            mask = masks[i].float()
             subimage = color * mask
             mask = mask.repeat(1,1,3,1,1)
             full_plot = torch.cat([full_plot, mask, subimage], dim=1) #(T,2+K+K,3,D,D)

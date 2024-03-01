@@ -77,8 +77,9 @@ Models:
     vit_use_pretrained: True
     vit_freeze: True
     vit_feature_level: 12
-    use_onehot: True
     independent_modules: True
+    stochastic_head: False
+    stochastic_dim: 32
 
     transformer_layer:
       embed_dim: 512
