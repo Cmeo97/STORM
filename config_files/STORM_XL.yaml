@@ -21,13 +21,13 @@ JointTrainAgent:
   TrainDynamicsEverySteps: 1
   TrainAgentEverySteps: 1
   UseDemonstration: False
-  SaveEverySteps: 3000
+  SaveEverySteps: 1050
 
 Models:
   WorldModel:
     InChannels: 3
     TransformerMaxLength: 341 # (sequence length + 1)
-    TransformerHiddenDim: 512
+    TransformerHiddenDim: 256
     TransformerNumLayers: 4
     TransformerNumHeads: 8
     Transformer: TransformerXL
@@ -79,11 +79,14 @@ Models:
     vit_feature_level: 12
     independent_modules: True
     stochastic_head: False
-    stochastic_dim: 32
+    stochastic_dim: 16  #16*16 = 256
+    action_emb_dim: 128
+    wm_oc_pool_layer: mlp #cls-transformer
+
 
     transformer_layer:
-      embed_dim: 512
-      feedforward_dim: 1024
+      embed_dim: 256
+      feedforward_dim: 512
       head_dim: 64
       num_heads: 4
       activation: 'silu' 
@@ -105,7 +108,8 @@ Models:
     iters: 3
     channels_enc: 128
     token_dim: 128 # need to match embed_dim if no pre_process_conv
-    prior_class: gru
+    prior_class: grucell
+    pred_prior_from: last
 
   Agent:
     NumLayers: 2
@@ -113,3 +117,11 @@ Models:
     Gamma: 0.985
     Lambda: 0.95
     EntropyCoef: 3E-4
+    pooling_layer: cls-transformer  #cls-transformer dino-sbd
+
+  CLSTransformer:
+    HiddenDim: 512
+    NumLayers: 2
+    NumHeads: 8
+ 
+

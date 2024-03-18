@@ -111,14 +111,16 @@ class TransformerXL(nn.Module):
         self.action_dim = action_dim
         self.feat_dim = feat_dim
         self.conf = conf
+        input_dim = stoch_dim + self.conf.Models.WorldModel.action_emb_dim
         # mix image_embedding and action
         self.stem = nn.Sequential(
-            nn.Linear(stoch_dim+action_dim, feat_dim, bias=False),
+            nn.Linear(input_dim, feat_dim, bias=False),
             nn.LayerNorm(feat_dim),
             nn.ReLU(inplace=True),
             nn.Linear(feat_dim, feat_dim, bias=False),
             nn.LayerNorm(feat_dim)
         )
+        self.action_embedder = nn.Embedding(action_dim, self.conf.Models.WorldModel.action_emb_dim)
         transformer_layer = TransformerXLDecoderLayer(**transformer_layer_config)
         self.layers = nn.ModuleList([copy.deepcopy(transformer_layer) for _ in range(num_layers)])
         self.num_layers = num_layers
@@ -152,7 +154,7 @@ class TransformerXL(nn.Module):
         if mems is None:
             mems = self.init_mems()
 
-        action = F.one_hot(action.long(), self.action_dim).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=1).float()
+        action = F.one_hot(action.long(), self.action_dim).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=1).float() if self.conf.Models.WorldModel.stochastic_head else self.action_embedder(action.int()).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=1)
         if self.batch_first:
             action = action.transpose(0,1)
         feats = self.stem(torch.cat([x, action], dim=-1))

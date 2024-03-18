@@ -180,7 +180,7 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
         # <<< train world model part
 
         # train agent part >>>
-        if replay_buffer.ready() and total_steps % (train_agent_every_steps//num_envs) == 0 and total_steps*num_envs >= 0 and total_steps > 30000:
+        if replay_buffer.ready() and total_steps % (train_agent_every_steps//num_envs) == 0 and total_steps*num_envs >= 0 and total_steps > 40000:
             
             log_video = True if total_steps % (save_every_steps//num_envs) == 0 else False
 
@@ -244,10 +244,10 @@ def build_world_model(conf, action_dim, device):
 
 
 
-def build_agent(conf, action_dim, device):
+def build_agent(conf, action_dim, device, world_model):
     
     return agents.ActorCriticAgent(
-        feat_dim=32*32+conf.Models.WorldModel.TransformerHiddenDim,
+        feat_dim=conf.Models.CLSTransformer.HiddenDim,
         num_layers=conf.Models.Agent.NumLayers,
         hidden_dim=conf.Models.Agent.HiddenDim,
         action_dim=action_dim,
@@ -256,7 +256,8 @@ def build_agent(conf, action_dim, device):
         entropy_coef=conf.Models.Agent.EntropyCoef,
         device=device, 
         dtype=conf.BasicSettings.dtype,
-        conf=conf
+        conf=conf,
+        world_model=world_model
     ).to(device)
 
 
@@ -294,7 +295,7 @@ if __name__ == "__main__":
 
         # build world model and agent
         world_model = build_world_model(conf, action_dim, args.device)
-        agent = build_agent(conf, action_dim, args.device)
+        agent = build_agent(conf, action_dim, args.device, world_model)
 
         # build replay buffer
         replay_buffer = ReplayBuffer(

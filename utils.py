@@ -128,6 +128,8 @@ def load_config(config_path):
     conf.Models.WorldModel.independent_modules = True
     conf.Models.WorldModel.stochastic_head = False
     conf.Models.WorldModel.stochastic_dim = 32
+    conf.Models.WorldModel.action_emb_dim = 128
+    conf.Models.WorldModel.wm_oc_pool_layer = 'cls-transformer'
 
     
     conf.Models.WorldModel.transformer_layer.embed_dim = 256
@@ -153,7 +155,8 @@ def load_config(config_path):
     conf.Models.Slot_attn.iters = 3
     conf.Models.Slot_attn.channels_enc = 128
     conf.Models.Slot_attn.token_dim = 128 # need to match embed_dim if no pre_process_conv
-    conf.Models.Slot_attn.prior_class = 'gru'
+    conf.Models.Slot_attn.prior_class = 'grucell'
+    conf.Models.Slot_attn.pred_prior_from = 'last'
 
     conf.Models.Agent = CN()
     conf.Models.Agent.NumLayers = 0
@@ -161,6 +164,12 @@ def load_config(config_path):
     conf.Models.Agent.Gamma = 1.0
     conf.Models.Agent.Lambda = 0.0
     conf.Models.Agent.EntropyCoef = 0.0
+    conf.Models.Agent.pooling_layer = 'dino-sbd'
+
+    conf.Models.CLSTransformer = CN()
+    conf.Models.CLSTransformer.NumLayers = 0
+    conf.Models.CLSTransformer.HiddenDim = 256
+    conf.Models.CLSTransformer.NumHeads = 4
 
     conf.JointTrainAgent = CN()
     conf.JointTrainAgent.SampleMaxSteps = 0
