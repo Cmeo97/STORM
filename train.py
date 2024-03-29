@@ -46,7 +46,8 @@ def build_vec_env(env_name, image_size, num_envs, seed):
 
 def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel, batch_size, demonstration_batch_size, batch_length, logger, device, log_recs):
     obs, action, reward, termination = replay_buffer.sample(batch_size, demonstration_batch_size, batch_length, device)
-    world_model.update(obs, action, reward, termination, logger=logger, log_recs=log_recs)
+    # world_model.update(obs, action, reward, termination, logger=logger, log_recs=log_recs)
+    world_model.update_separate(obs, action, reward, termination, logger=logger, log_recs=log_recs)
 
 
 @torch.no_grad()
@@ -276,6 +277,7 @@ if __name__ == "__main__":
     parser.add_argument("-env_name", type=str, required=True)
     parser.add_argument("-trajectory_path", type=str, required=True)
     parser.add_argument("-device", type=str, required=False, default='cuda:0')
+    parser.add_argument("-pretrained_path", type=str, required=False, default=None)
     args = parser.parse_args()
     conf = load_config(args.config_path)
     print(colorama.Fore.RED + str(args) + colorama.Style.RESET_ALL)
@@ -295,6 +297,8 @@ if __name__ == "__main__":
 
         # build world model and agent
         world_model = build_world_model(conf, action_dim, args.device)
+        if args.pretrained_path is not None:
+            world_model.load(args.pretrained_path, device=args.device)
         agent = build_agent(conf, action_dim, args.device, world_model)
 
         # build replay buffer

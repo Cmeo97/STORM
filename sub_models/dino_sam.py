@@ -11,6 +11,7 @@ class TokenizerWithSAMEncoderOutput:
     inits: torch.FloatTensor
     z_vit: torch.FloatTensor
 
+
 @dataclass
 class SAConfig:
     num_slots: int
@@ -23,6 +24,7 @@ class SAConfig:
     @property
     def slot_dim(self):
         return self.tokens_per_slot * self.token_dim
+
 
 class SlotAttentionVideo(nn.Module):
     def __init__(self, config: SAConfig, eps=1e-8, hidden_dim=128) -> None:
@@ -85,7 +87,6 @@ class SlotAttentionVideo(nn.Module):
         self._init_params()
 
         self.is_video = True
-
 
     def _init_params(self):
         for name, tensor in self.named_parameters():
@@ -385,8 +386,8 @@ class DinoSAM_OCextractor(nn.Module):
         for t in range(z.shape[1]-1):
             z_curr = z[:, t]
             z_next = z[:, t+1]
-            z_curr = z_curr / z_curr.norm(dim=-1, keepdim=True)
-            z_next = z_next / z_next.norm(dim=-1, keepdim=True)
+            z_curr = z_curr / z_curr.norm(dim=-2, keepdim=True)
+            z_next = z_next / z_next.norm(dim=-2, keepdim=True)
             # matrix of cosine similarities between all pairs of slots for each sample in batch
             pairwise_sim = torch.bmm(z_curr.transpose(1, 2), z_next)
             loss = torch.pow(torch.diagonal(pairwise_sim, dim1=-2, dim2=-1) - torch.ones(num_slots, device=pairwise_sim.device).expand(B, -1), 2).mean()
@@ -394,7 +395,64 @@ class DinoSAM_OCextractor(nn.Module):
         cosine_loss /= (T-1)
         return cosine_loss
 
+    def vit_encode(self, x: torch.Tensor) -> torch.Tensor:
+        def _transformer_compute_positions(features):
+            """Compute positions for Transformer features."""
+            n_tokens = features.shape[1]
+            image_size = sqrt(n_tokens)
+            image_size_int = int(image_size)
+            assert (
+                image_size_int == image_size
+            ), "Position computation for Transformers requires square image"
+    
+            spatial_dims = (image_size_int, image_size_int)
+            positions = torch.cartesian_prod(
+                *[torch.linspace(0.0, 1.0, steps=dim, device=features.device) for dim in spatial_dims]
+            )
+            return positions
+        
+        if self.run_in_eval_mode and self.training:
+            self.eval()
   
+        if self.vit_freeze:
+            # Speed things up a nvidiabit by not requiring grad computation.
+            with torch.no_grad():
+                features = self.vit.forward_features(x)
+        else:
+            features = self.vit.forward_features(x)
+  
+        if self._feature_hooks is not None:
+            hook_features = [hook.pop() for hook in self._feature_hooks]
+  
+        if len(self.feature_levels) == 0:
+            # Remove class token when not using hooks.
+            features = features[:, 1:]
+            positions = _transformer_compute_positions(features)
+        else:
+            features = hook_features[: len(self.feature_levels)]
+            positions = _transformer_compute_positions(features[0])
+            features = torch.cat(features, dim=-1)
+  
+        return features, positions
+    
+    def dino_encode(self, x: torch.Tensor):
+        x = self.preprocess_input(x)
+
+        shape = x.shape  # (..., C, H, W)
+        x = x.reshape(-1, *shape[-3:])
+        z, _ = self.vit_encode(x)
+        z = self.pos_embed(z)
+  
+        if self.slot_attn.is_video:
+            z = z.reshape(*shape[:-3], *z.shape[1:]) # video
+            if z.dim() == 3:
+                z = z.unsqueeze(1)
+        z, attns = self.slot_attn(z)
+        z_vit, _ = self.vit_encode(x)
+        z_vit = z_vit.reshape(*shape[:-3], *z_vit.shape[1:])
+  
+        return z, attns, z_vit
+
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         shape = z.shape  # (..., C, D)
         z = z.view(-1, *shape[-2:])
@@ -435,6 +493,7 @@ class DinoSAM_OCextractor(nn.Module):
         """y is supposed to be channels first and in [-1, 1]"""
         return y.add(1).div(2)
     
+
 class PositionalEmbedding(nn.Module):
     def __init__(self, resolution: List[int], channels: int):
         super().__init__()
@@ -459,6 +518,7 @@ class PositionalEmbedding(nn.Module):
         )
         x = x + self.channels_map(bs_linear_position_embedding)
         return x
+
 
 class SpatialBroadcastDecoder(nn.Module):
     def __init__(self, resolution: int, dec_input_dim: int, dec_hidden_dim: int, out_ch: int) -> None:
@@ -519,7 +579,7 @@ class SpatialBroadcastDecoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bs = x.shape[0]
         K = x.shape[1] # number of slots
-        x = self.spatial_broadcast(x.permute(0,1,3,2))
+        x = self.spatial_broadcast(x)
         x = self.pos_embedding(x)
         x = self.layers(x)
 
@@ -531,8 +591,6 @@ class SpatialBroadcastDecoder(nn.Module):
         rec = (colors * masks).sum(dim=1)
 
         return rec, colors, masks
-
-      
 
     def spatial_broadcast(self, slot: torch.Tensor) -> torch.Tensor:
         slot = slot.reshape(-1, slot.shape[-1])

@@ -11,7 +11,7 @@ JointTrainAgent:
   BufferMaxLength: 100000
   BufferWarmUp: 1024
   NumEnvs: 1
-  BatchSize: 16
+  BatchSize: 4
   DemonstrationBatchSize: 4
   BatchLength: 16
   ImagineBatchSize: 16
@@ -64,7 +64,7 @@ Models:
     wm_batch_size: 100
     wm_sequence_length: 340
     wm_train_steps: 1
-    wm_memory_length: 21
+    wm_memory_length: 21 # keep at 3 * # slots
     wm_discount_threshold: 0.1
     regularization_post_quant: False
     regularization_tokens: False
