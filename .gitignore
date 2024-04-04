@@ -4,3 +4,5 @@ launch.json
 *.pyc
 *.quechua1
 runs/
+venv/
+*.pt
