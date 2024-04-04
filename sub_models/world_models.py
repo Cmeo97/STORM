@@ -331,9 +331,11 @@ class WorldModel(nn.Module):
             )
             
             self.downsample = Resize(size=(conf.Models.Decoder.resolution, conf.Models.Decoder.resolution))
-            self.dino_parameters = list(self.dino.parameters()) + list(self.image_decoder.parameters()) 
+            self.dino_parameters = list(self.dino.parameters()) 
+            self.decoder_parameters = list(self.image_decoder.parameters()) 
             self.wm_parameters = list(self.storm_transformer.parameters()) + list(self.wm_oc_pool_layer.parameters()) + list(self.slots_head.parameters()) + list(self.termination_decoder.parameters()) + list(self.reward_decoder.parameters()) + list(self.dist_head.parameters()) 
             self.dino_optimizer = torch.optim.Adam(self.dino_parameters, lr=0.0002)
+            self.decoder_optimizer = torch.optim.Adam(self.decoder_parameters, lr=0.0002)
             self.wm_optimizer = torch.optim.Adam(self.wm_parameters, lr=1e-4)
 
         else:
@@ -628,9 +630,9 @@ class WorldModel(nn.Module):
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
             slots_loss = F.mse_loss(embedding.detach(), slots_hat)
             # dyn-rep loss
-            dino_and_dec_loss = dino_loss + decoder_loss
+            
             wm_loss = reward_loss + slots_loss + termination_loss 
-            total_loss = dino_and_dec_loss + wm_loss
+            total_loss = dino_loss + decoder_loss + wm_loss
             if self.conf.Models.WorldModel.stochastic_head:
                 dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]).detach(), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]))
                 representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]).detach())
@@ -640,12 +642,19 @@ class WorldModel(nn.Module):
         # gradient descent
         if self.conf.Models.WorldModel.model=='OC-irisXL':
             # DINO Optimization
-            self.scaler.scale(dino_and_dec_loss).backward()
+            self.scaler.scale(dino_loss).backward()
             self.scaler.unscale_(self.dino_optimizer)  # for clip grad
-            torch.nn.utils.clip_grad_norm_(self.dino_parameters, max_norm=1.0)
+            norm_dino = torch.nn.utils.clip_grad_norm_(self.dino_parameters, max_norm=1.0)
             self.scaler.step(self.dino_optimizer)
             self.scaler.update()
             self.dino_optimizer.zero_grad(set_to_none=True)
+            # Decoder Optimization
+            self.scaler.scale(decoder_loss).backward()
+            self.scaler.unscale_(self.decoder_optimizer)  # for clip grad
+            norm_decoder = torch.nn.utils.clip_grad_norm_(self.dino_parameters, max_norm=1.0)
+            self.scaler.step(self.decoder_optimizer)
+            self.scaler.update()
+            self.decoder_optimizer.zero_grad(set_to_none=True)
             # WM Optimization
             self.scaler.scale(wm_loss).backward()
             self.scaler.unscale_(self.wm_optimizer)  # for clip grad
@@ -666,6 +675,8 @@ class WorldModel(nn.Module):
             logger.log("WorldModel/consistency_loss", consistency_loss.item())
             logger.log("WorldModel/dino_reconstruction_loss", dino_reconstruction_loss.item())
             logger.log("WorldModel/decoder_reconstruction_loss", decoder_loss.item())
+            logger.log("WorldModel/dino_norm", norm_dino.item())
+            logger.log("WorldModel/decoder_norm", norm_decoder.item())
             logger.log("WorldModel/reward_loss", reward_loss.item())
             logger.log("WorldModel/slots_loss", slots_loss.item())
             logger.log("WorldModel/termination_loss", termination_loss.item())
