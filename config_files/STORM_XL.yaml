@@ -21,7 +21,7 @@ JointTrainAgent:
   TrainDynamicsEverySteps: 1
   TrainAgentEverySteps: 1
   UseDemonstration: False
-  SaveEverySteps: 1050
+  SaveEverySteps: 1025
 
 Models:
   WorldModel:
@@ -103,7 +103,7 @@ Models:
     dec_output_dim: 768 # MLPDecoder
 
   Slot_attn:
-    num_slots: 7 # num_tokens = num_slots * tokens_per_slot
+    num_slots: 5 # num_tokens = numx_slots * tokens_per_slot
     tokens_per_slot: 1
     iters: 3
     channels_enc: 128

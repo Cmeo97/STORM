@@ -15,6 +15,10 @@ from agents import TransformerWithCLS
 import agents
 from math import sqrt
 from sub_models.dino_sam import DinoSAM_OCextractor, SpatialBroadcastDecoder
+from typing import Union, Iterable, List, Dict, Tuple, Optional
+from torch import Tensor, inf
+from torch.utils._foreach_utils import _group_tensors_by_device_and_dtype, _has_foreach_support
+_tensor_or_tensors = Union[torch.Tensor, Iterable[torch.Tensor]]
 
 
 def linear_warmup_exp_decay(warmup_steps: Optional[int] = None, exp_decay_rate: Optional[float] = None, exp_decay_steps: Optional[int] = None):
@@ -143,6 +147,12 @@ class DistHead(nn.Module):
         self.stoch_dim = stoch_dim
         self.post_head = nn.Linear(image_feat_dim, stoch_dim*stoch_dim)
         self.prior_head = nn.Linear(transformer_hidden_dim, stoch_dim*stoch_dim)
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                torch.nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    m.bias.data.fill_(0.01)
+        #self.apply(init_weights)
 
     def unimix(self, logits, mixing_ratio=0.01):
         # uniform noise mixing
@@ -199,8 +209,17 @@ class RewardDecoder(nn.Module):
             nn.Linear(transformer_hidden_dim, transformer_hidden_dim, bias=False),
             nn.LayerNorm(transformer_hidden_dim),
             nn.ReLU(inplace=True),
+ 
         )
         self.head = nn.Linear(transformer_hidden_dim, num_classes)
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                torch.nn.init.orthogonal_(m.weight)
+                if m.bias is not None:
+                    m.bias.data.fill_(0.01)
+        #self.apply(init_weights)
+
+
 
     def forward(self, feat):
         feat = self.backbone(feat)
@@ -223,6 +242,12 @@ class TerminationDecoder(nn.Module):
             nn.Linear(transformer_hidden_dim, 1),
             # nn.Sigmoid()
         )
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                torch.nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    m.bias.data.fill_(0.01)
+        #self.apply(init_weights)
 
     def forward(self, feat):
         feat = self.backbone(feat)
@@ -242,6 +267,12 @@ class SlotsHead(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(transformer_hidden_dim, embedding_size),
         )
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                torch.nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    m.bias.data.fill_(0.01)
+        #self.apply(init_weights)
 
     def forward(self, feat):
         feat = self.backbone(feat)
@@ -302,7 +333,7 @@ class WorldModel(nn.Module):
                 transformer_layer_config=conf.Models.WorldModel.transformer_layer, 
                 num_layers=conf.Models.WorldModel.TransformerNumLayers,
                 max_length=conf.Models.WorldModel.TransformerMaxLength,
-                mem_length=conf.Models.WorldModel.wm_memory_length,
+                mem_length=3*conf.Models.Slot_attn.num_slots,
                 conf=conf
             )
             self.image_decoder = SpatialBroadcastDecoder(
@@ -348,16 +379,14 @@ class WorldModel(nn.Module):
             )
             
             self.downsample = Resize(size=(conf.Models.Decoder.resolution, conf.Models.Decoder.resolution))
-            self.dino_parameters = list(self.dino.parameters()) + list(self.image_decoder.parameters()) 
+            self.dino_parameters = list(self.dino.parameters()) 
             self.wm_parameters = list(self.storm_transformer.parameters()) + list(self.wm_oc_pool_layer.parameters()) + list(self.slots_head.parameters()) + list(self.termination_decoder.parameters()) + list(self.reward_decoder.parameters()) + list(self.dist_head.parameters()) 
             self.dec_parameters = list(self.image_decoder.parameters())
             self.dino_optimizer = torch.optim.Adam(self.dino_parameters, lr=0.0002)
-            self.decoder_optimizer = torch.optim.Adam(self.decoder_parameters, lr=0.0002)
             self.wm_optimizer = torch.optim.Adam(self.wm_parameters, lr=1e-4)
             self.dec_optimizer = torch.optim.Adam(self.dec_parameters, lr=0.0002)
 
             self.dino_scheduler = torch.optim.lr_scheduler.LambdaLR(self.dino_optimizer, lr_lambda=linear_warmup_exp_decay(10000, 0.5, 100000))
-            # self.dino_scheduler = None
             self.wm_scheduler = None
             self.dec_scheduler = None
 
@@ -607,7 +636,7 @@ class WorldModel(nn.Module):
             colors_hat, masks_hat = torch.cat(colors_hat_list, dim=1), torch.cat(masks_hat_list, dim=1)
             logger.log("Imagine/predict_video", obs_hat.cpu().float().detach().numpy())
             obs_hat_list = self.compute_image_with_slots(obs_downsampled, obs_hat, colors_hat, masks_hat)
-            logger.log("Imagine/predict_slots_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
+            logger.log("Imagine/predict_slots_images", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).squeeze(1).cpu().float().detach().numpy(), imagine_batch_length)
 
         return torch.cat([self.latent_buffer, self.hidden_buffer], dim=-1), self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer
 
@@ -679,12 +708,19 @@ class WorldModel(nn.Module):
         # gradient descent
         if self.conf.Models.WorldModel.model=='OC-irisXL':
             # DINO Optimization
-            self.scaler.scale(dino_and_dec_loss).backward()
+            self.scaler.scale(dino_loss).backward()
             self.scaler.unscale_(self.dino_optimizer)  # for clip grad
             torch.nn.utils.clip_grad_norm_(self.dino_parameters, max_norm=1.0)
             self.scaler.step(self.dino_optimizer)
             self.scaler.update()
             self.dino_optimizer.zero_grad(set_to_none=True)
+            # DEC Optimization
+            self.scaler.scale(decoder_loss).backward()
+            self.scaler.unscale_(self.dec_optimizer)  # for clip grad
+            torch.nn.utils.clip_grad_norm_(self.dec_parameters, max_norm=1.0)
+            self.scaler.step(self.dec_optimizer)
+            self.scaler.update()
+            self.dec_optimizer.zero_grad(set_to_none=True)
             # WM Optimization
             self.scaler.scale(wm_loss).backward()
             self.scaler.unscale_(self.wm_optimizer)  # for clip grad
@@ -719,8 +755,8 @@ class WorldModel(nn.Module):
             logger.log("WorldModel/consistency_loss", consistency_loss.item())
             logger.log("WorldModel/dino_reconstruction_loss", dino_reconstruction_loss.item())
             logger.log("WorldModel/decoder_reconstruction_loss", decoder_loss.item())
-            logger.log("WorldModel/dino_norm", norm_dino.item())
-            logger.log("WorldModel/decoder_norm", norm_decoder.item())
+            logger.log("WorldModel/dino_norm", dino_norm.item())
+            logger.log("WorldModel/decoder_norm", dec_norm.item())
             logger.log("WorldModel/reward_loss", reward_loss.item())
             logger.log("WorldModel/slots_loss", slots_loss.item())
             logger.log("WorldModel/termination_loss", termination_loss.item())
@@ -736,7 +772,7 @@ class WorldModel(nn.Module):
             if log_recs:
                 #logger.log("WorldModel/predict_slots_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
                 obs_hat_list = self.compute_image_with_slots(obs_downsampled, obs_hat, rearrange(colors, '(b t) s c h w -> b t s c h w', b=batch_size), rearrange(masks, '(b t) s c h w -> b t s c h w', b=batch_size))
-                logger.log("DINO/video/predict_slots_recs", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
+                logger.log("DINO/images/predict_slots_recs", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).squeeze(1).cpu().float().detach().numpy(), obs_hat.shape[1])
     
     def update_separate(self, obs, action, reward, termination, logger=None, log_recs=False):
         # self.train()
@@ -780,24 +816,18 @@ class WorldModel(nn.Module):
 
         with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
             with torch.no_grad():
-                embedding, _, _ = self.dino.dino_encode(obs.reshape(-1, 4, *obs.shape[2:]))
-            embedding = embedding.reshape(batch_size, batch_length, *embedding.shape[2:])
+                embedding, _, _ = self.dino.dino_encode(obs)
+            post_logits = self.dist_head.forward_post(embedding)
+            flattened_sample = self.flatten_sample(self.stright_throught_gradient(post_logits, sample_mode="random_sample")) if self.conf.Models.WorldModel.stochastic_head else post_logits
+
+            # transformer
             history_length = embedding.shape[1]
             src_length = tgt_length = history_length * self.conf.Models.Slot_attn.num_slots
             device = embedding.device
             positions = torch.arange(history_length - 1, -1, -1, device=device).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=0).long() if self.conf.Models.WorldModel.slot_based  else torch.arange(src_length - 1, -1, -1, device=device) 
-
-            post_logits = self.dist_head.forward_post(embedding.detach()) if self.conf.Models.WorldModel.independent_modules else self.dist_head.forward_post(embedding)
-            if self.conf.Models.WorldModel.stochastic_head:
-                sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
-            
-            flattened_sample = self.flatten_sample(sample) if self.conf.Models.WorldModel.stochastic_head else post_logits
-
-            # transformer
             temporal_mask = get_causal_mask(src_length, tgt_length, embedding.device, termination, self.conf.Models.Slot_attn.num_slots)
             dist_feat = self.storm_transformer(flattened_sample, action, temporal_mask, positions)
-            if self.conf.Models.WorldModel.stochastic_head:
-                prior_logits = self.dist_head.forward_prior(dist_feat)
+
             # decoding reward and termination with dist_feat
             slots_hat = self.slots_head(dist_feat)
             combined_dist_feat = rearrange(dist_feat, 'b t s e-> b t (s e)') if self.conf.Models.WorldModel.wm_oc_pool_layer != 'cls-transformer' else dist_feat
@@ -812,8 +842,16 @@ class WorldModel(nn.Module):
             # dyn-rep loss
             wm_loss = reward_loss + slots_loss + termination_loss 
 
+            # if stochastin representations used:
+            if self.conf.Models.WorldModel.stochastic_head:
+                prior_logits = self.dist_head.forward_prior(dist_feat)
+                dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]).detach(), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]))
+                representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]).detach())
+                wm_loss += 0.5*dynamics_loss + 0.1*representation_loss
+
         self.scaler.scale(wm_loss).backward()
         self.scaler.unscale_(self.wm_optimizer)  # for clip grad
+        #trial_norm = self.trial_clip_grad_norm_(self.wm_parameters, max_norm=10.0)
         wm_norm = torch.nn.utils.clip_grad_norm_(self.wm_parameters, max_norm=10.0)
         self.scaler.step(self.wm_optimizer)
         self.scaler.update()
@@ -866,19 +904,97 @@ class WorldModel(nn.Module):
             logger.log("WorldModel/reward_loss", reward_loss.item())
             logger.log("WorldModel/slots_loss", slots_loss.item())
             logger.log("WorldModel/termination_loss", termination_loss.item())
-            # if self.conf.Models.WorldModel.stochastic_head:
-            #     logger.log("WorldModel/dynamics_loss", dynamics_loss.item())
-            #     logger.log("WorldModel/dynamics_real_kl_div", dynamics_real_kl_div.item())
-            #     logger.log("WorldModel/representation_loss", representation_loss.item())
-            #     logger.log("WorldModel/representation_real_kl_div", representation_real_kl_div.item())
+            if self.conf.Models.WorldModel.stochastic_head:
+                logger.log("WorldModel/dynamics_loss", dynamics_loss.item())
+                logger.log("WorldModel/dynamics_real_kl_div", dynamics_real_kl_div.item())
+                logger.log("WorldModel/representation_loss", representation_loss.item())
+                logger.log("WorldModel/representation_real_kl_div", representation_real_kl_div.item())
             logger.log("WorldModel/total_loss", total_loss.item())
             logger.log("WorldModelNorm/dino_norm", dino_norm.item())
             logger.log("WorldModelNorm/wm_norm", wm_norm.item())
             logger.log("WorldModelNorm/dec_norm", dec_norm.item())
+            print('wm_logged')
             if log_recs:
                 #logger.log("WorldModel/predict_slots_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
                 obs_hat_list = self.compute_image_with_slots(obs_downsampled, obs_hat, rearrange(colors, '(b t) s c h w -> b t s c h w', b=batch_size), rearrange(masks, '(b t) s c h w -> b t s c h w', b=batch_size))
-                logger.log("DINO/video/predict_slots_recs", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
+                logger.log("DINO/images/predict_slots_recs", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).squeeze(1).cpu().float().detach().numpy(), obs_hat.shape[1])
+
+
+
+    def trial_clip_grad_norm_(self, 
+            parameters: _tensor_or_tensors, max_norm: float, norm_type: float = 2.0,
+            error_if_nonfinite: bool = False, foreach: Optional[bool] = None) -> torch.Tensor:
+        r"""Clips gradient norm of an iterable of parameters.
+
+        The norm is computed over all gradients together, as if they were
+        concatenated into a single vector. Gradients are modified in-place.
+
+        Args:
+            parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
+                single Tensor that will have gradients normalized
+            max_norm (float): max norm of the gradients
+            norm_type (float): type of the used p-norm. Can be ``'inf'`` for
+                infinity norm.
+            error_if_nonfinite (bool): if True, an error is thrown if the total
+                norm of the gradients from :attr:`parameters` is ``nan``,
+                ``inf``, or ``-inf``. Default: False (will switch to True in the future)
+            foreach (bool): use the faster foreach-based implementation.
+                If ``None``, use the foreach implementation for CUDA and CPU native tensors and silently
+                fall back to the slow implementation for other device types.
+                Default: ``None``
+
+        Returns:
+            Total norm of the parameter gradients (viewed as a single vector).
+        """
+        if isinstance(parameters, torch.Tensor):
+            parameters = [parameters]
+        grads = [p.grad for p in parameters if p.grad is not None]
+        max_norm = float(max_norm)
+        norm_type = float(norm_type)
+        if len(grads) == 0:
+            return torch.tensor(0.)
+        first_device = grads[0].device
+        grouped_grads: Dict[Tuple[torch.device, torch.dtype], List[List[Tensor]]] \
+            = _group_tensors_by_device_and_dtype([[g.detach() for g in grads]])  # type: ignore[assignment]
+
+        if norm_type == inf:
+            norms = [g.detach().abs().max().to(first_device) for g in grads]
+            total_norm = norms[0] if len(norms) == 1 else torch.max(torch.stack(norms))
+        else:
+            norms = []
+            for ((device, _), [grads]) in grouped_grads.items():
+                if (foreach is None or foreach) and _has_foreach_support(grads, device=device):
+                    norms.extend(torch._foreach_norm(grads, norm_type))
+                elif foreach:
+                    raise RuntimeError(f'foreach=True was passed, but can\'t use the foreach API on {device.type} tensors')
+                else:
+                    norms.extend([torch.norm(g, norm_type) for g in grads])
+
+            total_norm = torch.norm(torch.stack([norm.to(first_device) for norm in norms]), norm_type)
+            print(torch.stack([norm.to(first_device) for norm in norms]))
+
+        if error_if_nonfinite and torch.logical_or(total_norm.isnan(), total_norm.isinf()):
+            raise RuntimeError(
+                f'The total norm of order {norm_type} for gradients from '
+                '`parameters` is non-finite, so it cannot be clipped. To disable '
+                'this error and scale the gradients by the non-finite norm anyway, '
+                'set `error_if_nonfinite=False`')
+        clip_coef = max_norm / (total_norm + 1e-6)
+        # Note: multiplying by the clamped coef is redundant when the coef is clamped to 1, but doing so
+        # avoids a `if clip_coef < 1:` conditional which can require a CPU <=> device synchronization
+        # when the gradients do not reside in CPU memory.
+        clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
+        for ((device, _), [grads]) in grouped_grads.items():
+            if (foreach is None or foreach) and _has_foreach_support(grads, device=device):
+                torch._foreach_mul_(grads, clip_coef_clamped.to(device))  # type: ignore[call-overload]
+            elif foreach:
+                raise RuntimeError(f'foreach=True was passed, but can\'t use the foreach API on {device.type} tensors')
+            else:
+                clip_coef_clamped_device = clip_coef_clamped.to(device)
+                for g in grads:
+                    g.detach().mul_(clip_coef_clamped_device)
+
+        return total_norm
 
     @torch.no_grad()
     def compute_image_with_slots(self, obs, recons, colors, masks):

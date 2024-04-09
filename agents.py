@@ -45,6 +45,12 @@ class TransformerWithCLS(nn.Module):
             #norm_first=norm_first
         )
         self._trans = nn.TransformerEncoder(encoder_layer, num_layers)
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                torch.nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    m.bias.data.fill_(0.01)
+        #self.apply(init_weights)
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         B, L = state.shape[:2]

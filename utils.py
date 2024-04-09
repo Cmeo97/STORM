@@ -27,7 +27,7 @@ class Logger():
         self.writer = SummaryWriter(logdir=path, flush_secs=1)
         self.tag_step = {}
 
-    def log(self, tag, value):
+    def log(self, tag, value, n_cols=8):
         if tag not in self.tag_step:
             self.tag_step[tag] = 0
         else:
@@ -35,7 +35,7 @@ class Logger():
         if "video" in tag:
             self.writer.add_video(tag, value, self.tag_step[tag], fps=15)
         elif "images" in tag:
-            self.writer.add_images(tag, value, self.tag_step[tag])
+            self.writer.add_images(tag, value, self.tag_step[tag], n_cols=n_cols)
         elif "hist" in tag:
             self.writer.add_histogram(tag, value, self.tag_step[tag])
         else:
