@@ -128,7 +128,7 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
                         prior_flattened_sample, last_dist_feat = world_model.calc_last_dist_feat(context_latent, model_context_action)
                     
                     action = agent.sample_as_env_action(
-                        torch.cat([prior_flattened_sample, last_dist_feat], dim=-1),
+                        (prior_flattened_sample, last_dist_feat),
                         greedy=False
                     )
 
@@ -181,7 +181,7 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
         # <<< train world model part
 
         # train agent part >>>
-        if replay_buffer.ready() and total_steps % (train_agent_every_steps//num_envs) == 0 and total_steps*num_envs >= 0 and total_steps > 40000:
+        if replay_buffer.ready() and total_steps % (train_agent_every_steps//num_envs) == 0 and total_steps*num_envs >= 0 and total_steps > 0: #40000:
             
             log_video = True if total_steps % (save_every_steps//num_envs) == 0 else False
 
@@ -248,7 +248,7 @@ def build_world_model(conf, action_dim, device):
 def build_agent(conf, action_dim, device, world_model):
     
     return agents.ActorCriticAgent(
-        feat_dim=conf.Models.CLSTransformer.HiddenDim,
+        feat_dim=(conf.Models.CLSTransformer.z_dim, conf.Models.WorldModel.TransformerHiddenDim),
         num_layers=conf.Models.Agent.NumLayers,
         hidden_dim=conf.Models.Agent.HiddenDim,
         action_dim=action_dim,
@@ -258,7 +258,8 @@ def build_agent(conf, action_dim, device, world_model):
         device=device, 
         dtype=conf.BasicSettings.dtype,
         conf=conf,
-        world_model=world_model
+        world_model=world_model,
+        state=conf.Models.Agent.state,
     ).to(device)
 
 

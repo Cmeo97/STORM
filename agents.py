@@ -91,7 +91,7 @@ class MLP(nn.Module):
         return feats
 
 class ActorCriticAgent(nn.Module):
-    def __init__(self, feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef, device='cuda:0', dtype='torch.float16', conf=None, world_model=None) -> None:
+    def __init__(self, feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef, device='cuda:0', dtype='torch.float16', conf=None, world_model=None, state='joint') -> None:
         super().__init__()
         self.gamma = gamma
         self.lambd = lambd
@@ -100,15 +100,23 @@ class ActorCriticAgent(nn.Module):
         self.tensor_dtype = torch.float16 if dtype == 'torch.float16' else torch.bfloat16 if dtype == 'torch.bfloat16' else torch.float32
         self.device = device
         self.symlog_twohot_loss = SymLogTwoHotLoss(255, -20, 20)
-
+        self.state = state
         self.conf = conf
         if self.conf.Models.WorldModel.model == 'OC-irisXL':
             if self.conf.Models.Agent.pooling_layer == 'dino-sbd':
                 self.OC_pool_layer = world_model.dino.decoder
                 self.OC_pool_layer.eval()
             if self.conf.Models.Agent.pooling_layer == 'cls-transformer':
-                self.OC_pool_layer = TransformerWithCLS(feat_dim, self.conf.Models.CLSTransformer.HiddenDim, self.conf.Models.CLSTransformer.NumHeads, self.conf.Models.CLSTransformer.NumLayers)
-
+                if state == 'joint':
+                    self.OC_pool_layer_z_hat = TransformerWithCLS(feat_dim[0], self.conf.Models.CLSTransformer.HiddenDim, self.conf.Models.CLSTransformer.NumHeads, self.conf.Models.CLSTransformer.NumLayers)
+                    self.OC_pool_layer_h = TransformerWithCLS(feat_dim[1], self.conf.Models.CLSTransformer.HiddenDim, self.conf.Models.CLSTransformer.NumHeads, self.conf.Models.CLSTransformer.NumLayers)
+                    actor_feat = critic_feat = self.conf.Models.CLSTransformer.HiddenDim*2
+                elif state=='z':
+                    self.OC_pool_layer_z_hat = TransformerWithCLS(feat_dim[0], self.conf.Models.CLSTransformer.HiddenDim, self.conf.Models.CLSTransformer.NumHeads, self.conf.Models.CLSTransformer.NumLayers)
+                    actor_feat = critic_feat = self.conf.Models.CLSTransformer.HiddenDim
+                else:
+                    self.OC_pool_layer_h = TransformerWithCLS(feat_dim[1], self.conf.Models.CLSTransformer.HiddenDim, self.conf.Models.CLSTransformer.NumHeads, self.conf.Models.CLSTransformer.NumLayers)
+                    actor_feat = critic_feat = self.conf.Models.CLSTransformer.HiddenDim
             # DINO decode function
             #shape = z.shape  # (..., C, D)
             #z = z.view(-1, *shape[-2:])
@@ -117,7 +125,7 @@ class ActorCriticAgent(nn.Module):
   
 
         actor = [
-            nn.Linear(feat_dim, hidden_dim, bias=False),
+            nn.Linear(actor_feat, hidden_dim, bias=False),
             nn.LayerNorm(hidden_dim),
             nn.ReLU()
         ]
@@ -133,7 +141,7 @@ class ActorCriticAgent(nn.Module):
         )
 
         critic = [
-            nn.Linear(feat_dim, hidden_dim, bias=False),
+            nn.Linear(critic_feat, hidden_dim, bias=False),
             nn.LayerNorm(hidden_dim),
             nn.ReLU()
         ]
@@ -163,13 +171,13 @@ class ActorCriticAgent(nn.Module):
 
     def policy(self, x):
         if self.conf.Models.WorldModel.model == 'OC-irisXL':
-            x = self.OC_pool_layer(x)
+            x = self.pool_states(x)
         logits = self.actor(x)
         return logits
 
     def value(self, x):
         if self.conf.Models.WorldModel.model == 'OC-irisXL':
-            x = self.OC_pool_layer(x)        
+            x = self.pool_states(x)        
         value = self.critic(x)
         value = self.symlog_twohot_loss.decode(value)
         return value
@@ -177,14 +185,14 @@ class ActorCriticAgent(nn.Module):
     @torch.no_grad()
     def slow_value(self, x):
         if self.conf.Models.WorldModel.model == 'OC-irisXL':
-            x = self.OC_pool_layer(x)
+            x = self.pool_states(x)
         value = self.slow_critic(x)
         value = self.symlog_twohot_loss.decode(value)
         return value
 
     def get_logits_raw_value(self, x):
         if self.conf.Models.WorldModel.model == 'OC-irisXL':
-            x = self.OC_pool_layer(x)
+            x = self.pool_states(x)
         logits = self.actor(x)
         raw_value = self.critic(x)
         return logits, raw_value
@@ -254,6 +262,17 @@ class ActorCriticAgent(nn.Module):
             logger.log('ActorCritic/S', S.item())
             logger.log('ActorCritic/norm_ratio', norm_ratio.item())
             logger.log('ActorCritic/total_loss', loss.item())
+
+    def pool_states(self, x):
+        if self.state == 'joint':
+            z = self.OC_pool_layer_z_hat(x[0])
+            h = self.OC_pool_layer_h(x[1])
+            state = torch.concatenate([z,h], dim=-1)
+        elif self.state == 'z':
+            state = self.OC_pool_layer_z_hat(x[0])
+        else:
+            state = self.OC_pool_layer_h(x[1])
+        return state 
 
 
 class OCActorCriticAgent(ActorCriticAgent):

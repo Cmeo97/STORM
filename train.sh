@@ -1,8 +1,9 @@
 env_name=Boxing
 device=3
-seed=11
+seed=102
 stochastic=false
-exp_name=${env_name}-life_done-wm_2L512D8H-100k-seed_${seed}_stochastic_${stochastic}
+state=h
+exp_name=${env_name}-life_done-wm_2L512D8H-100k-seed_${seed}_stochastic_${stochastic}_state_${state}
 nohup python -u train.py \
     -n ${exp_name} \
     -seed ${seed} \

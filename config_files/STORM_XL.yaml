@@ -21,7 +21,7 @@ JointTrainAgent:
   TrainDynamicsEverySteps: 1
   TrainAgentEverySteps: 1
   UseDemonstration: False
-  SaveEverySteps: 1025
+  SaveEverySteps: 1035
 
 Models:
   WorldModel:
@@ -118,10 +118,12 @@ Models:
     Lambda: 0.95
     EntropyCoef: 3E-4
     pooling_layer: cls-transformer  #cls-transformer dino-sbd
+    state: h
 
   CLSTransformer:
     HiddenDim: 512
     NumLayers: 2
     NumHeads: 8
+    z_dim: 128
  
 

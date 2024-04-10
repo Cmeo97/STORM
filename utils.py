@@ -165,11 +165,13 @@ def load_config(config_path):
     conf.Models.Agent.Lambda = 0.0
     conf.Models.Agent.EntropyCoef = 0.0
     conf.Models.Agent.pooling_layer = 'dino-sbd'
+    conf.Models.Agent.state = 'joint'
 
     conf.Models.CLSTransformer = CN()
     conf.Models.CLSTransformer.NumLayers = 0
     conf.Models.CLSTransformer.HiddenDim = 256
     conf.Models.CLSTransformer.NumHeads = 4
+    conf.Models.CLSTransformer.z_dim = 128
 
     conf.JointTrainAgent = CN()
     conf.JointTrainAgent.SampleMaxSteps = 0
