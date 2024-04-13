@@ -777,7 +777,8 @@ class WorldModel(nn.Module):
                 obs_hat_list = self.compute_image_with_slots(obs_downsampled, obs_hat, rearrange(colors, '(b t) s c h w -> b t s c h w', b=batch_size), rearrange(masks, '(b t) s c h w -> b t s c h w', b=batch_size))
                 logger.log("DINO/images/predict_slots_recs", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).squeeze(1).cpu().float().detach().numpy(), obs_hat.shape[1])
     
-    def update_separate(self, obs, action, reward, termination, logger=None, log_recs=False):
+
+    def update_dino(self, obs, action, reward, termination, logger=None, log_recs=False):
         # self.train()
 
         ###########################
@@ -806,8 +807,14 @@ class WorldModel(nn.Module):
 
         self.dino_optimizer.zero_grad(set_to_none=True)
 
-        ###########################
-        ###########################
+        if logger is not None:
+            logger.log("WorldModel/consistency_loss", consistency_loss.item())
+            logger.log("WorldModel/dino_reconstruction_loss", dino_reconstruction_loss.item())
+            logger.log("WorldModelNorm/dino_norm", dino_norm.item())
+      
+        
+
+    def update_wm(self, obs, action, reward, termination, logger=None, log_recs=False):
         # train wm
         self.eval()
         self.dist_head.train()
@@ -875,9 +882,9 @@ class WorldModel(nn.Module):
             obs_downsampled = self.downsample(rearrange(obs, 'b t c h w -> (b t) c h w'))
             obs_downsampled = rearrange(obs_downsampled, '(b t) c h w -> b t c h w', b=batch_size)
 
-            with torch.no_grad():
-                embedding, _, _ = self.dino.dino_encode(obs.reshape(-1, 4, *obs.shape[2:]))
-            embedding = embedding.reshape(batch_size, batch_length, *embedding.shape[2:])
+            #with torch.no_grad():
+            #    embedding, _, _ = self.dino.dino_encode(obs.reshape(-1, 4, *obs.shape[2:]))
+            #embedding = embedding.reshape(batch_size, batch_length, *embedding.shape[2:])
 
             # decoding image
             obs_hat, colors, masks = self.image_decoder(rearrange(embedding, 'b t s e -> (b t) s e').detach())
@@ -898,11 +905,10 @@ class WorldModel(nn.Module):
 
         self.dec_optimizer.zero_grad(set_to_none=True)
 
-        total_loss = dino_loss + wm_loss + decoder_loss
+        total_loss = wm_loss + decoder_loss
 
         if logger is not None:
-            logger.log("WorldModel/consistency_loss", consistency_loss.item())
-            logger.log("WorldModel/dino_reconstruction_loss", dino_reconstruction_loss.item())
+
             logger.log("WorldModel/decoder_reconstruction_loss", decoder_loss.item())
             logger.log("WorldModel/reward_loss", reward_loss.item())
             logger.log("WorldModel/slots_loss", slots_loss.item())
@@ -913,7 +919,6 @@ class WorldModel(nn.Module):
                 logger.log("WorldModel/representation_loss", representation_loss.item())
                 logger.log("WorldModel/representation_real_kl_div", representation_real_kl_div.item())
             logger.log("WorldModel/total_loss", total_loss.item())
-            logger.log("WorldModelNorm/dino_norm", dino_norm.item())
             logger.log("WorldModelNorm/wm_norm", wm_norm.item())
             logger.log("WorldModelNorm/dec_norm", dec_norm.item())
           

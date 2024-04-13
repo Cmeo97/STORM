@@ -6,3 +6,5 @@ launch.json
 runs/
 venv/
 *.pt
+outputs/
+*.out

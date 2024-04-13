@@ -27,7 +27,7 @@ class Logger():
         self.writer = SummaryWriter(logdir=path, flush_secs=1)
         self.tag_step = {}
 
-    def log(self, tag, value, n_cols=8):
+    def log(self, tag, value, n_cols=16):
         if tag not in self.tag_step:
             self.tag_step[tag] = 0
         else:
@@ -68,6 +68,13 @@ def load_config(config_path):
     conf.BasicSettings.ImageSize = 0
     conf.BasicSettings.ReplayBufferOnGPU = False
     conf.BasicSettings.dtype = 'bfloat16'
+    conf.BasicSettings.pretrained = None
+    conf.BasicSettings.pretrained_path = None
+    conf.BasicSettings.n = 'exp_name'
+    conf.BasicSettings.config_path = 'config_files/STORM_XL.yam'
+    conf.BasicSettings.env_name = 'ALE/Boxing-v5'
+    conf.BasicSettings.trajectory_path = 'D_TRAJ/Boxing.pkl'
+    conf.BasicSettings.device = 'cuda:0'
     # Under this setting, input 128*128 -> latent 16*16*64
     conf.Models = CN()
 

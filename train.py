@@ -16,7 +16,9 @@ import json
 import shutil
 import pickle
 import os
-
+import hydra
+import warnings
+from omegaconf import DictConfig
 from utils import seed_np_torch, Logger, load_config
 from replay_buffer import ReplayBuffer
 import env_wrapper
@@ -47,7 +49,14 @@ def build_vec_env(env_name, image_size, num_envs, seed):
 def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel, batch_size, demonstration_batch_size, batch_length, logger, device, log_recs):
     obs, action, reward, termination = replay_buffer.sample(batch_size, demonstration_batch_size, batch_length, device)
     # world_model.update(obs, action, reward, termination, logger=logger, log_recs=log_recs)
-    world_model.update_separate(obs, action, reward, termination, logger=logger, log_recs=log_recs)
+    world_model.update_dino(obs, action, reward, termination, logger=logger, log_recs=log_recs)
+    world_model.update_wm(obs, action, reward, termination, logger=logger, log_recs=log_recs)
+
+def train_dino_step(replay_buffer: ReplayBuffer, world_model: WorldModel, batch_size, demonstration_batch_size, batch_length, logger, device, log_recs):
+    obs, action, reward, termination = replay_buffer.sample(batch_size, demonstration_batch_size, batch_length, device)
+    # world_model.update(obs, action, reward, termination, logger=logger, log_recs=log_recs)
+    world_model.update_dino(obs, action, reward, termination, logger=logger, log_recs=log_recs)
+
 
 
 @torch.no_grad()
@@ -89,9 +98,9 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
                                   batch_size, demonstration_batch_size, batch_length,
                                   imagine_batch_size, imagine_demonstration_batch_size,
                                   imagine_context_length, imagine_batch_length,
-                                  save_every_steps, seed, logger, device):
+                                  save_every_steps, seed, logger, device, n):
     # create ckpt dir
-    os.makedirs(f"ckpt/{args.n}", exist_ok=True)
+    os.makedirs(f"ckpt/{n}", exist_ok=True)
 
     # build vec env, not useful in the Atari100k setting
     # but when the max_steps is large, you can use parallel envs to speed up
@@ -164,9 +173,20 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
         current_obs = obs
         current_info = info
         # <<< sample part
-
+        if replay_buffer.ready() and total_steps % (train_dynamics_every_steps//num_envs) == 0 and total_steps < 63000:
+            log_recs = True if total_steps % (save_every_steps//num_envs) == 0 else False
+            train_dino_step(
+                replay_buffer=replay_buffer,
+                world_model=world_model,
+                batch_size=batch_size,
+                demonstration_batch_size=demonstration_batch_size,
+                batch_length=batch_length,
+                logger=logger,
+                device=device,
+                log_recs=log_recs
+            )
         # train world model part >>>
-        if replay_buffer.ready() and total_steps % (train_dynamics_every_steps//num_envs) == 0:
+        if replay_buffer.ready() and total_steps % (train_dynamics_every_steps//num_envs) == 0 and total_steps >= 63000:
             log_recs = True if total_steps % (save_every_steps//num_envs) == 0 else False
             train_world_model_step(
                 replay_buffer=replay_buffer,
@@ -181,7 +201,7 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
         # <<< train world model part
 
         # train agent part >>>
-        if replay_buffer.ready() and total_steps % (train_agent_every_steps//num_envs) == 0 and total_steps*num_envs >= 0 and total_steps > 0: #40000:
+        if replay_buffer.ready() and total_steps % (train_agent_every_steps//num_envs) == 0 and total_steps*num_envs >= 0 and total_steps > 40000:
             
             log_video = True if total_steps % (save_every_steps//num_envs) == 0 else False
 
@@ -212,11 +232,11 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
         # save model per episode
         if total_steps % (save_every_steps//num_envs) == 0:
             print(colorama.Fore.GREEN + f"Saving model at total steps {total_steps}" + colorama.Style.RESET_ALL)
-            torch.save(world_model.state_dict(), f"ckpt/{args.n}/world_model_last.pth")
-            torch.save(agent.state_dict(), f"ckpt/{args.n}/agent_last.pth")
+            torch.save(world_model.state_dict(), f"ckpt/{n}/world_model_last.pth")
+            torch.save(agent.state_dict(), f"ckpt/{n}/agent_last.pth")
             if last_reward_best != reward_best:
-                torch.save(world_model.state_dict(), f"ckpt/{args.n}/world_model_best.pth")
-                torch.save(agent.state_dict(), f"ckpt/{args.n}/agent_best.pth")
+                torch.save(world_model.state_dict(), f"ckpt/{n}/world_model_best.pth")
+                torch.save(agent.state_dict(), f"ckpt/{n}/agent_best.pth")
                 last_reward_best = reward_best
 
 
@@ -263,45 +283,42 @@ def build_agent(conf, action_dim, device, world_model):
     ).to(device)
 
 
-if __name__ == "__main__":
+@hydra.main(config_path="../STORM/config_files", config_name="STORM_XL")
+def main(conf: DictConfig):  
     # ignore warnings
-    import warnings
+    
     warnings.filterwarnings('ignore')
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-
     # parse arguments
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-n", type=str, required=True)
-    parser.add_argument("-seed", type=int, required=True)
-    parser.add_argument("-config_path", type=str, required=True)
-    parser.add_argument("-env_name", type=str, required=True)
-    parser.add_argument("-trajectory_path", type=str, required=True)
-    parser.add_argument("-device", type=str, required=False, default='cuda:0')
-    parser.add_argument("-pretrained_path", type=str, required=False, default=None)
-    args = parser.parse_args()
-    conf = load_config(args.config_path)
-    print(colorama.Fore.RED + str(args) + colorama.Style.RESET_ALL)
-
+    #parser = argparse.ArgumentParser()
+    #parser.add_argument("-n", type=str, required=True)
+    #parser.add_argument("-seed", type=int, required=True)
+    #parser.add_argument("-config_path", type=str, required=True)
+    #parser.add_argument("-env_name", type=str, required=True)
+    #parser.add_argument("-trajectory_path", type=str, required=True)
+    #parser.add_argument("-device", type=str, required=False, default='cuda:0')
+    #parser.add_argument("-pretrained_path", type=str, required=False, default=None)
+    #args = parser.parse_args()
+    #conf = load_config(args.config_path)
+    #print(colorama.Fore.RED + str(conf) + colorama.Style.RESET_ALL)
     # set seed
-    seed_np_torch(seed=args.seed)
+    seed_np_torch(seed=conf.BasicSettings.Seed)
     # tensorboard writer
-    logger = Logger(path=f"runs/{args.n}")
+    logger = Logger(path=f"runs/{conf.BasicSettings.n}")
     # copy config file
-    shutil.copy(args.config_path, f"runs/{args.n}/config.yaml")
-
+    #shutil.copy(config_path, f"runs/{conf.BasicSettings.n}/config.yaml")
     # distinguish between tasks, other debugging options are removed for simplicity
     if conf.Task == "JointTrainAgent":
         # getting action_dim with dummy env
-        dummy_env = build_single_env(args.env_name, conf.BasicSettings.ImageSize, seed=0)
+        dummy_env = build_single_env(conf.BasicSettings.env_name, conf.BasicSettings.ImageSize, seed=conf.BasicSettings.Seed)
         action_dim = dummy_env.action_space.n
-
         # build world model and agent
-        world_model = build_world_model(conf, action_dim, args.device)
-        if args.pretrained_path is not None:
-            world_model.load(args.pretrained_path, device=args.device)
-        agent = build_agent(conf, action_dim, args.device, world_model)
-
+        world_model = build_world_model(conf, action_dim, conf.BasicSettings.device)
+        print(conf.BasicSettings.pretrained_path)
+        if conf.BasicSettings.pretrained_path != 'None':
+            world_model.load(conf.BasicSettings.pretrained_path, device=conf.BasicSettings.device)
+        agent = build_agent(conf, action_dim, conf.BasicSettings.device, world_model)
         # build replay buffer
         replay_buffer = ReplayBuffer(
             obs_shape=(conf.BasicSettings.ImageSize, conf.BasicSettings.ImageSize, 3),
@@ -309,18 +326,16 @@ if __name__ == "__main__":
             max_length=conf.JointTrainAgent.BufferMaxLength,
             warmup_length=conf.JointTrainAgent.BufferWarmUp,
             store_on_gpu=conf.BasicSettings.ReplayBufferOnGPU,
-            device=args.device,
+            device=conf.BasicSettings.device,
         )
-
         # judge whether to load demonstration trajectory
         if conf.JointTrainAgent.UseDemonstration:
-            print(colorama.Fore.MAGENTA + f"loading demonstration trajectory from {args.trajectory_path}" + colorama.Style.RESET_ALL)
-            replay_buffer.load_trajectory(path=args.trajectory_path, device=args.device)
-
+            print(colorama.Fore.MAGENTA + f"loading demonstration trajectory from {conf.BasicSettings.trajectory_path}" + colorama.Style.RESET_ALL)
+            replay_buffer.load_trajectory(path=conf.BasicSettings.trajectory_path, device=conf.BasicSettings.device)
         # train
         joint_train_world_model_agent(
             model_name=conf.Models.WorldModel.model,
-            env_name=args.env_name,
+            env_name=conf.BasicSettings.env_name,
             num_envs=conf.JointTrainAgent.NumEnvs,
             max_steps=conf.JointTrainAgent.SampleMaxSteps,
             image_size=conf.BasicSettings.ImageSize,
@@ -337,9 +352,13 @@ if __name__ == "__main__":
             imagine_context_length=conf.JointTrainAgent.ImagineContextLength,
             imagine_batch_length=conf.JointTrainAgent.ImagineBatchLength,
             save_every_steps=conf.JointTrainAgent.SaveEverySteps,
-            seed=args.seed,
+            seed=conf.BasicSettings.Seed,
             logger=logger,
-            device=args.device
+            device=conf.BasicSettings.device,
+            n=conf.BasicSettings.n
         )
     else:
         raise NotImplementedError(f"Task {conf.Task} not implemented")
+
+if __name__ == "__main__":
+    main()
