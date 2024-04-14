@@ -19,7 +19,7 @@ from typing import Union, Iterable, List, Dict, Tuple, Optional
 from torch import Tensor, inf
 from torch.utils._foreach_utils import _group_tensors_by_device_and_dtype, _has_foreach_support
 _tensor_or_tensors = Union[torch.Tensor, Iterable[torch.Tensor]]
-
+from .dino_transformer_utils import *
 
 def linear_warmup_exp_decay(warmup_steps: Optional[int] = None, exp_decay_rate: Optional[float] = None, exp_decay_steps: Optional[int] = None):
     assert (exp_decay_steps is None) == (exp_decay_rate is None)
@@ -358,6 +358,8 @@ class WorldModel(nn.Module):
             
             if conf.Models.WorldModel.wm_oc_pool_layer == 'cls-transformer':
                 self.wm_oc_pool_layer = TransformerWithCLS(transformer_hidden_dim, transformer_hidden_dim, self.conf.Models.CLSTransformer.NumHeads, self.conf.Models.CLSTransformer.NumLayers)
+            elif conf.Models.WorldModel.wm_oc_pool_layer == 'dino-mlp':
+                self.wm_oc_pool_layer = BroadcastPoolLayer(transformer_hidden_dim, [transformer_hidden_dim, transformer_hidden_dim], transformer_hidden_dim)
             else:
                 self.wm_oc_pool_layer = nn.Sequential(
                     nn.Linear(self.conf.Models.Slot_attn.num_slots*transformer_hidden_dim, transformer_hidden_dim, bias=False),
@@ -513,7 +515,7 @@ class WorldModel(nn.Module):
                 prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
                 prior_flattened_sample = self.flatten_sample(prior_sample)
             else:
-                if self.conf.Models.WorldModel.wm_oc_pool_layer == 'dino-sbd' or self.conf.Models.WorldModel.wm_oc_pool_layer == 'mlp':
+                if self.conf.Models.WorldModel.wm_oc_pool_layer == 'dino-sbd' or self.conf.Models.WorldModel.wm_oc_pool_layer == 'mlp' or self.conf.Models.WorldModel.wm_oc_pool_layer == 'dino-mlp':
                     slots_hat = self.slots_head(dist_feat)
                     prior_flattened_sample = slots_hat
                 else:
@@ -532,7 +534,7 @@ class WorldModel(nn.Module):
                 output_hat = None
             
             if self.conf.Models.WorldModel.model=='OC-irisXL':
-                combined_dist_feat = rearrange(dist_feat, 'b t s e-> b t (s e)') if self.conf.Models.WorldModel.wm_oc_pool_layer != 'cls-transformer' else dist_feat
+                combined_dist_feat = rearrange(dist_feat, 'b t s e-> b t (s e)') if self.conf.Models.WorldModel.wm_oc_pool_layer != 'cls-transformer' and self.conf.Models.WorldModel.wm_oc_pool_layer != 'dino-mlp' else dist_feat
                 combined_dist_feat = self.wm_oc_pool_layer(combined_dist_feat)
                 reward_hat = self.reward_decoder(combined_dist_feat)
                 reward_hat = self.symlog_twohot_loss_func.decode(reward_hat)
@@ -840,7 +842,7 @@ class WorldModel(nn.Module):
 
             # decoding reward and termination with dist_feat
             slots_hat = self.slots_head(dist_feat)
-            combined_dist_feat = rearrange(dist_feat, 'b t s e-> b t (s e)') if self.conf.Models.WorldModel.wm_oc_pool_layer != 'cls-transformer' else dist_feat
+            combined_dist_feat = rearrange(dist_feat, 'b t s e-> b t (s e)') if self.conf.Models.WorldModel.wm_oc_pool_layer != 'cls-transformer' and self.conf.Models.WorldModel.wm_oc_pool_layer != 'dino-mlp' else dist_feat
             combined_dist_feat = self.wm_oc_pool_layer(combined_dist_feat)
             reward_hat = self.reward_decoder(combined_dist_feat)
             termination_hat = self.termination_decoder(combined_dist_feat)

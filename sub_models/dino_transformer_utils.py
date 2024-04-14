@@ -359,3 +359,39 @@ class MLPDecoder(nn.Module):
 
         return reconstruction, masks, masks_as_image
 
+class BroadcastPoolLayer(nn.Module):
+    def __init__(self, dec_input_dim, dec_hidden_layers, dec_output_dim) -> None:
+        super().__init__()
+
+   
+        self.dec_input_dim = dec_input_dim
+        self.dec_hidden_layers = dec_hidden_layers
+        self.dec_output_dim = dec_output_dim
+        
+        layers = []
+        current_dim = dec_input_dim
+    
+        for dec_hidden_dim in dec_hidden_layers:
+            layers.append(nn.Linear(current_dim, dec_hidden_dim))
+            nn.init.zeros_(layers[-1].bias)
+            layers.append(nn.ReLU(inplace=True))
+            current_dim = dec_hidden_dim
+
+        layers.append(nn.Linear(current_dim, dec_output_dim + 1))
+        nn.init.zeros_(layers[-1].bias)
+        
+        self.layers = nn.Sequential(*layers)
+
+        self.pos_embed = nn.Parameter(torch.randn(1, 1, 1, dec_input_dim) * 0.02)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    
+        z = z + self.pos_embed
+        out = self.layers(z)
+       
+        # Split out alpha channel and normalize over slots.
+        decoded_patches, alpha = out.split([self.dec_output_dim, 1], dim=-1)
+        alpha = alpha.softmax(dim=-2)
+        pooled_z = torch.sum(decoded_patches * alpha, dim=-2)
+        
+        return pooled_z

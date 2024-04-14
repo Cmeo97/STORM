@@ -6,11 +6,11 @@ BasicSettings:
   ReplayBufferOnGPU: True
   dtype: torch.float16
   pretrained: None
-  n: exp_name
+  n: Boxing-life_done-wm_2L512D8H-100k-seed1
   config_path: config_files/STORM_XL.yam
   env_name: ALE/Boxing-v5
   trajectory_path: D_TRAJ/Boxing.pkl
-  device: cuda:0
+  device: cuda:1
   pretrained_path: None
 
 
@@ -32,7 +32,7 @@ JointTrainAgent:
   TrainDynamicsEverySteps: 1
   TrainAgentEverySteps: 1
   UseDemonstration: False
-  SaveEverySteps: 5000
+  SaveEverySteps: 1030
 
 Models:
   WorldModel:
@@ -92,7 +92,7 @@ Models:
     stochastic_head: False
     stochastic_dim: 16  #16*16 = 256
     action_emb_dim: 128
-    wm_oc_pool_layer: mlp #cls-transformer
+    wm_oc_pool_layer: dino-mlp #cls-transformer
 
 
     transformer_layer:
@@ -106,7 +106,7 @@ Models:
 
   Decoder:
     resolution: 64
-    dec_input_dim: 64
+    dec_input_dim: 96
     dec_hidden_dim: 64
     out_ch: 4
     vit_num_patches: 196 # res 224
