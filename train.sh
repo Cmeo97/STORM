@@ -28,7 +28,7 @@ BasicSettings.config_path="config_files/STORM_XL.yaml" \
 BasicSettings.env_name="ALE/${env_name}-v5" \
 BasicSettings.trajectory_path="D_TRAJ/${env_name}.pkl" \
 BasicSettings.device=cuda:${device} \
-Models.WorldModel.wm_oc_pool_layer=${pool_layer}
+Models.WorldModel.wm_oc_pool_layer=${pool_layer} \
 > 'logs/'${exp_name}'.out' 2> 'logs/'${exp_name}'.err'
 
 

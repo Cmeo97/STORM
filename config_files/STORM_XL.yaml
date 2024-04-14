@@ -10,7 +10,7 @@ BasicSettings:
   config_path: config_files/STORM_XL.yam
   env_name: ALE/Boxing-v5
   trajectory_path: D_TRAJ/Boxing.pkl
-  device: cuda:1
+  device: cuda:0
   pretrained_path: None
 
 
