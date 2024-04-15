@@ -65,7 +65,7 @@ class MultiHeadAttention_(nn.Module):
             num_v_channels = num_qk_channels
 
         if num_output_channels is None:
-            num_output_channels = num_q_input_channels
+            num_output_channels = num_kv_input_channels
 
         if num_qk_channels % num_heads != 0:
             raise ValueError("num_qk_channels must be divisible by num_heads")

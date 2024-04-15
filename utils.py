@@ -137,7 +137,7 @@ def load_config(config_path):
     conf.Models.WorldModel.stochastic_dim = 32
     conf.Models.WorldModel.action_emb_dim = 128
     conf.Models.WorldModel.wm_oc_pool_layer = 'cls-transformer'
-
+    conf.Models.WorldModel.mixer_type = 'concat'
     
     conf.Models.WorldModel.transformer_layer.embed_dim = 256
     conf.Models.WorldModel.transformer_layer.feedforward_dim = 1024

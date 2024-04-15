@@ -94,7 +94,8 @@ Models:
     stochastic_head: False
     stochastic_dim: 16  #16*16 = 256
     action_emb_dim: 128
-    wm_oc_pool_layer: dino-mlp #cls-transformer
+    wm_oc_pool_layer: dino-mlp 
+    mixer_type: z+attn
 
 
     transformer_layer:
@@ -130,11 +131,11 @@ Models:
     Gamma: 0.985
     Lambda: 0.95
     EntropyCoef: 3E-4
-    pooling_layer: cls-transformer  #cls-transformer dino-sbd
+    pooling_layer: dino-mlp  #cls-transformer dino-sbd
     state: z
 
   CLSTransformer:
-    HiddenDim: 512
+    HiddenDim: 256
     NumLayers: 2
     NumHeads: 8
     z_dim: 96

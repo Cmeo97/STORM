@@ -6,7 +6,7 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 import copy
 from torch.cuda.amp import autocast
-
+from sub_models.dino_transformer_utils import *
 from sub_models.functions_losses import SymLogTwoHotLoss
 from utils import EMAScalar
 
@@ -103,9 +103,6 @@ class ActorCriticAgent(nn.Module):
         self.state = state
         self.conf = conf
         if self.conf.Models.WorldModel.model == 'OC-irisXL':
-            if self.conf.Models.Agent.pooling_layer == 'dino-sbd':
-                self.OC_pool_layer = world_model.dino.decoder
-                self.OC_pool_layer.eval()
             if self.conf.Models.Agent.pooling_layer == 'cls-transformer':
                 if state == 'joint':
                     self.OC_pool_layer_z_hat = TransformerWithCLS(feat_dim[0], self.conf.Models.CLSTransformer.HiddenDim, self.conf.Models.CLSTransformer.NumHeads, self.conf.Models.CLSTransformer.NumLayers)
@@ -116,6 +113,17 @@ class ActorCriticAgent(nn.Module):
                     actor_feat = critic_feat = self.conf.Models.CLSTransformer.HiddenDim
                 else:
                     self.OC_pool_layer_h = TransformerWithCLS(feat_dim[1], self.conf.Models.CLSTransformer.HiddenDim, self.conf.Models.CLSTransformer.NumHeads, self.conf.Models.CLSTransformer.NumLayers)
+                    actor_feat = critic_feat = self.conf.Models.CLSTransformer.HiddenDim
+            elif self.conf.Models.Agent.pooling_layer == 'dino-mlp':
+                if state == 'joint':
+                    self.OC_pool_layer_z_hat = BroadcastPoolLayer(feat_dim[0], [conf.Models.WorldModel.TransformerHiddenDim, conf.Models.WorldModel.TransformerHiddenDim], conf.Models.WorldModel.TransformerHiddenDim)
+                    self.OC_pool_layer_h = BroadcastPoolLayer(feat_dim[1], [conf.Models.WorldModel.TransformerHiddenDim, conf.Models.WorldModel.TransformerHiddenDim], conf.Models.WorldModel.TransformerHiddenDim)
+                    actor_feat = critic_feat = self.conf.Models.CLSTransformer.HiddenDim*2
+                elif state=='z':
+                    self.OC_pool_layer_z_hat = BroadcastPoolLayer(feat_dim[0], [conf.Models.WorldModel.TransformerHiddenDim, conf.Models.WorldModel.TransformerHiddenDim], conf.Models.WorldModel.TransformerHiddenDim)
+                    actor_feat = critic_feat = self.conf.Models.CLSTransformer.HiddenDim
+                else:
+                    self.OC_pool_layer_h = BroadcastPoolLayer(feat_dim[1], [conf.Models.WorldModel.TransformerHiddenDim, conf.Models.WorldModel.TransformerHiddenDim], conf.Models.WorldModel.TransformerHiddenDim)
                     actor_feat = critic_feat = self.conf.Models.CLSTransformer.HiddenDim
             # DINO decode function
             #shape = z.shape  # (..., C, D)
@@ -248,8 +256,8 @@ class ActorCriticAgent(nn.Module):
         # gradient descent
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.optimizer)  # for clip grad
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=100.0)
-        self.scaler.step(self.optimizer)
+        agent_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=40.0)
+        #if (agent_norm != torch.nan).any() and (agent_norm != torch.inf).any() and (agent_norm != -torch.inf).any():
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -262,6 +270,11 @@ class ActorCriticAgent(nn.Module):
             logger.log('ActorCritic/S', S.item())
             logger.log('ActorCritic/norm_ratio', norm_ratio.item())
             logger.log('ActorCritic/total_loss', loss.item())
+            logger.log("WorldModelNorm/agent_norm", agent_norm.item())
+            logs = torch.tensor([policy_loss.item(), value_loss.item(), entropy_loss.item(), S.item(), norm_ratio.item(), loss.item(), agent_norm.item()])
+            print('Agent logs: ', logs)
+            if (logs == torch.nan).any() or (logs == torch.inf).any() or (logs == -torch.inf).any():
+                print('inf or nan found')
 
     def pool_states(self, x):
         if self.state == 'joint':

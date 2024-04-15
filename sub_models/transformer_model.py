@@ -156,7 +156,8 @@ class TransformerXL(nn.Module):
         #    nn.Linear(feat_dim, feat_dim, bias=False),
         #    nn.LayerNorm(feat_dim)
         #)
-        self.stem = StateMixer(stoch_dim, self.conf.Models.WorldModel.action_emb_dim, feat_dim, type=mixer_type)
+        num_head_mixer = 4 if 'attn' in mixer_type else None
+        self.stem = StateMixer(stoch_dim, self.conf.Models.WorldModel.action_emb_dim, feat_dim, type=mixer_type, num_heads=num_head_mixer)
         self.action_embedder = nn.Embedding(action_dim, self.conf.Models.WorldModel.action_emb_dim)
         transformer_layer = TransformerXLDecoderLayer(**transformer_layer_config)
         self.layers = nn.ModuleList([copy.deepcopy(transformer_layer) for _ in range(num_layers)])

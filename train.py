@@ -167,6 +167,11 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
                     logger.log(f"sample/{env_name}_episode_steps", current_info["episode_frame_number"][i]//4)  # framskip=4
                     logger.log("replay_buffer/length", len(replay_buffer))
                     sum_reward[i] = 0
+                    logs = torch.tensor([sum_reward[i],current_info["episode_frame_number"][i]//4,len(replay_buffer)])
+                    print('Env logs: ' ,logs)
+                    if (logs == torch.nan).any() or (logs == torch.inf).any() or (logs == -torch.inf).any():
+                        print('inf or nan found')
+          
 
         # update current_obs, current_info and sum_reward
         sum_reward += reward

@@ -335,7 +335,10 @@ class WorldModel(nn.Module):
                 num_layers=conf.Models.WorldModel.TransformerNumLayers,
                 max_length=conf.Models.WorldModel.TransformerMaxLength,
                 mem_length=3*conf.Models.Slot_attn.num_slots,
-                conf=conf
+                conf=conf,
+                batch_first=True,
+                slot_based=True,
+                mixer_type=conf.Models.WorldModel.mixer_type
             )
             self.image_decoder = SpatialBroadcastDecoder(
                 resolution=conf.Models.Decoder.resolution, 
@@ -384,6 +387,7 @@ class WorldModel(nn.Module):
             self.downsample = Resize(size=(conf.Models.Decoder.resolution, conf.Models.Decoder.resolution))
             self.dino_parameters = list(self.dino.parameters()) 
             self.wm_parameters = list(self.storm_transformer.parameters()) + list(self.wm_oc_pool_layer.parameters()) + list(self.slots_head.parameters()) + list(self.termination_decoder.parameters()) + list(self.reward_decoder.parameters()) + list(self.dist_head.parameters()) 
+            # Indexes of parameters list: idx0-idx1 related module |0-54 wm | 55-81 pool_layer | 82-85 slots_head | 86-93 termination_decoder | 94-101 reward_decoder | 102-106 dist_head 
             self.dec_parameters = list(self.image_decoder.parameters())
             self.dino_optimizer = torch.optim.Adam(self.dino_parameters, lr=0.0002)
             self.wm_optimizer = torch.optim.Adam(self.wm_parameters, lr=1e-4)
@@ -515,11 +519,8 @@ class WorldModel(nn.Module):
                 prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
                 prior_flattened_sample = self.flatten_sample(prior_sample)
             else:
-                if self.conf.Models.WorldModel.wm_oc_pool_layer == 'dino-sbd' or self.conf.Models.WorldModel.wm_oc_pool_layer == 'mlp' or self.conf.Models.WorldModel.wm_oc_pool_layer == 'dino-mlp':
-                    slots_hat = self.slots_head(dist_feat)
-                    prior_flattened_sample = slots_hat
-                else:
-                    prior_flattened_sample = dist_feat
+                prior_flattened_sample = slots_hat = self.slots_head(dist_feat)
+            
         
             if log_video:
                 slots_hat = self.slots_head(dist_feat[:8])
@@ -645,144 +646,142 @@ class WorldModel(nn.Module):
 
         return (self.latent_buffer, self.hidden_buffer), self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer
 
-    def update(self, obs, action, reward, termination, logger=None, log_recs=False):
-        self.train()
-        batch_size, batch_length = obs.shape[:2]
-
-        with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
-            obs_downsampled = self.downsample(rearrange(obs, 'b t c h w -> (b t) c h w'))
-            obs_downsampled = rearrange(obs_downsampled, '(b t) c h w -> b t c h w', b=batch_size)
-
-            # encoding
-            if self.conf.Models.WorldModel.model == 'OC-irisXL':
-                embedding, attns, z_vit = self.dino.dino_encode(obs.reshape(-1, 4, *obs.shape[2:]))  # embedding = slots
-                reconstructions = self.dino.decode(embedding)
-                embedding = embedding.reshape(batch_size, batch_length, *embedding.shape[2:])
-                history_length = embedding.shape[1]
-                src_length = tgt_length = history_length * self.conf.Models.Slot_attn.num_slots
-                device = embedding.device
-                positions = torch.arange(history_length - 1, -1, -1, device=device).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=0).long() if self.conf.Models.WorldModel.slot_based  else torch.arange(src_length - 1, -1, -1, device=device) 
-            else:
-                embedding = self.encoder(obs)
-                
-            post_logits = self.dist_head.forward_post(embedding.detach()) if self.conf.Models.WorldModel.independent_modules else self.dist_head.forward_post(embedding)
-            if self.conf.Models.WorldModel.stochastic_head:
-                sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
-            
-            flattened_sample = self.flatten_sample(sample) if self.conf.Models.WorldModel.stochastic_head else post_logits
-            
-            # decoding image
-            obs_hat, colors, masks = self.image_decoder(rearrange(embedding, 'b t s e -> (b t) s e').detach()) if self.conf.Models.WorldModel.model=='OC-irisXL' else self.image_decoder(flattened_sample)
-            
-            # transformer
-            temporal_mask = get_causal_mask(src_length, tgt_length, embedding.device, termination, self.conf.Models.Slot_attn.num_slots) if self.conf.Models.WorldModel.model == 'OC-irisXL' else get_subsequent_mask_with_batch_length(batch_length, flattened_sample.device)
-            dist_feat = self.storm_transformer(flattened_sample, action, temporal_mask, positions) if self.conf.Models.WorldModel.model == 'OC-irisXL' else self.storm_transformer(flattened_sample, action, temporal_mask) 
-            if self.conf.Models.WorldModel.stochastic_head:
-                prior_logits = self.dist_head.forward_prior(dist_feat)
-            # decoding reward and termination with dist_feat
-            if self.conf.Models.WorldModel.model=='OC-irisXL':
-                slots_hat = self.slots_head(dist_feat)
-                combined_dist_feat = rearrange(dist_feat, 'b t s e-> b t (s e)') if self.conf.Models.WorldModel.wm_oc_pool_layer != 'cls-transformer' else dist_feat
-                combined_dist_feat = self.wm_oc_pool_layer(combined_dist_feat)
-                reward_hat = self.reward_decoder(combined_dist_feat)
-                termination_hat = self.termination_decoder(combined_dist_feat)
-            else:
-                reward_hat = self.reward_decoder(dist_feat)
-                termination_hat = self.termination_decoder(dist_feat)
-
-            # DINO losses
-            consistency_loss = self.dino.cosine_loss(attns) if self.conf.Models.WorldModel.model == 'OC-irisXL' else 0
-            dino_reconstruction_loss = torch.pow(z_vit - reconstructions, 2).mean() if self.conf.Models.WorldModel.model == 'OC-irisXL' else 0
-            # decoder losses
-            obs_hat = rearrange(obs_hat, '(b t) c h w -> b t c h w', b=batch_size)
-            decoder_loss = torch.pow(obs_hat - obs_downsampled, 2).mean() if self.conf.Models.WorldModel.model == 'OC-irisXL' else 0
-            dino_loss = dino_reconstruction_loss + consistency_loss if self.conf.Models.WorldModel.model == 'OC-irisXL' else self.mse_loss_func(obs_hat, obs)
-            # STORM env losses
-            reward_loss = self.symlog_twohot_loss_func(reward_hat, reward)
-            termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
-            slots_loss = F.mse_loss(embedding.detach(), slots_hat)
-            # dyn-rep loss
-            
-            wm_loss = reward_loss + slots_loss + termination_loss 
-            total_loss = dino_loss + decoder_loss + wm_loss
-            if self.conf.Models.WorldModel.stochastic_head:
-                dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]).detach(), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]))
-                representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]).detach())
-                total_loss += 0.5*dynamics_loss + 0.1*representation_loss
-
-        # gradient descent
-        if self.conf.Models.WorldModel.model=='OC-irisXL':
-            # DINO Optimization
-            self.scaler.scale(dino_loss).backward()
-            self.scaler.unscale_(self.dino_optimizer)  # for clip grad
-            torch.nn.utils.clip_grad_norm_(self.dino_parameters, max_norm=1.0)
-            self.scaler.step(self.dino_optimizer)
-            self.scaler.update()
-            self.dino_optimizer.zero_grad(set_to_none=True)
-            # DEC Optimization
-            self.scaler.scale(decoder_loss).backward()
-            self.scaler.unscale_(self.dec_optimizer)  # for clip grad
-            torch.nn.utils.clip_grad_norm_(self.dec_parameters, max_norm=1.0)
-            self.scaler.step(self.dec_optimizer)
-            self.scaler.update()
-            self.dec_optimizer.zero_grad(set_to_none=True)
-            # WM Optimization
-            self.scaler.scale(wm_loss).backward()
-            self.scaler.unscale_(self.wm_optimizer)  # for clip grad
-            self.scaler.unscale_(self.dec_optimizer)  # for clip grad
-            dino_norm = torch.nn.utils.clip_grad_norm_(self.dino_parameters, max_norm=1.0)
-            wm_norm = torch.nn.utils.clip_grad_norm_(self.wm_parameters, max_norm=10.0)
-            dec_norm = torch.nn.utils.clip_grad_norm_(self.dec_parameters, max_norm=1.0)
-            self.scaler.step(self.dino_optimizer)
-            self.scaler.step(self.wm_optimizer)
-            self.scaler.step(self.dec_optimizer)
-            self.scaler.update()
-
-            if self.dino_scheduler is not None:
-                self.dino_scheduler.step()
-            if self.wm_scheduler is not None:
-                self.wm_scheduler.step()
-            if self.dec_scheduler is not None:
-                self.dec_scheduler.step()
-
-            self.dino_optimizer.zero_grad(set_to_none=True)
-            self.wm_optimizer.zero_grad(set_to_none=True)
-            self.dec_optimizer.zero_grad(set_to_none=True)
-        else:
-            self.scaler.scale(total_loss).backward()
-            self.scaler.unscale_(self.optimizer)  # for clip grad
-            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1000.0)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.optimizer.zero_grad(set_to_none=True)
-
-        if logger is not None:
-            logger.log("WorldModel/consistency_loss", consistency_loss.item())
-            logger.log("WorldModel/dino_reconstruction_loss", dino_reconstruction_loss.item())
-            logger.log("WorldModel/decoder_reconstruction_loss", decoder_loss.item())
-            logger.log("WorldModel/dino_norm", dino_norm.item())
-            logger.log("WorldModel/decoder_norm", dec_norm.item())
-            logger.log("WorldModel/reward_loss", reward_loss.item())
-            logger.log("WorldModel/slots_loss", slots_loss.item())
-            logger.log("WorldModel/termination_loss", termination_loss.item())
-            if self.conf.Models.WorldModel.stochastic_head:
-                logger.log("WorldModel/dynamics_loss", dynamics_loss.item())
-                logger.log("WorldModel/dynamics_real_kl_div", dynamics_real_kl_div.item())
-                logger.log("WorldModel/representation_loss", representation_loss.item())
-                logger.log("WorldModel/representation_real_kl_div", representation_real_kl_div.item())
-            logger.log("WorldModel/total_loss", total_loss.item())
-            logger.log("WorldModelNorm/dino_norm", dino_norm.item())
-            logger.log("WorldModelNorm/wm_norm", wm_norm.item())
-            logger.log("WorldModelNorm/dec_norm", dec_norm.item())
-            if log_recs:
-                #logger.log("WorldModel/predict_slots_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
-                obs_hat_list = self.compute_image_with_slots(obs_downsampled, obs_hat, rearrange(colors, '(b t) s c h w -> b t s c h w', b=batch_size), rearrange(masks, '(b t) s c h w -> b t s c h w', b=batch_size))
-                logger.log("DINO/images/predict_slots_recs", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).squeeze(1).cpu().float().detach().numpy(), obs_hat.shape[1])
+    #def update(self, obs, action, reward, termination, logger=None, log_recs=False):
+    #    self.train()
+    #    batch_size, batch_length = obs.shape[:2]
+#
+    #    with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
+    #        obs_downsampled = self.downsample(rearrange(obs, 'b t c h w -> (b t) c h w'))
+    #        obs_downsampled = rearrange(obs_downsampled, '(b t) c h w -> b t c h w', b=batch_size)
+#
+    #        # encoding
+    #        if self.conf.Models.WorldModel.model == 'OC-irisXL':
+    #            embedding, attns, z_vit = self.dino.dino_encode(obs.reshape(-1, 4, *obs.shape[2:]))  # embedding = slots
+    #            reconstructions = self.dino.decode(embedding)
+    #            embedding = embedding.reshape(batch_size, batch_length, *embedding.shape[2:])
+    #            history_length = embedding.shape[1]
+    #            src_length = tgt_length = history_length * self.conf.Models.Slot_attn.num_slots
+    #            device = embedding.device
+    #            positions = torch.arange(history_length - 1, -1, -1, device=device).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=0).long() if self.conf.Models.WorldModel.slot_based  else torch.arange(src_length - 1, -1, -1, device=device) 
+    #        else:
+    #            embedding = self.encoder(obs)
+    #            
+    #        post_logits = self.dist_head.forward_post(embedding.detach()) if self.conf.Models.WorldModel.independent_modules else self.dist_head.forward_post(embedding)
+    #        if self.conf.Models.WorldModel.stochastic_head:
+    #            sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
+    #        
+    #        flattened_sample = self.flatten_sample(sample) if self.conf.Models.WorldModel.stochastic_head else post_logits
+    #        
+    #        # decoding image
+    #        obs_hat, colors, masks = self.image_decoder(rearrange(embedding, 'b t s e -> (b t) s e').detach()) if self.conf.Models.WorldModel.model=='OC-irisXL' else self.image_decoder(flattened_sample)
+    #        
+    #        # transformer
+    #        temporal_mask = get_causal_mask(src_length, tgt_length, embedding.device, termination, self.conf.Models.Slot_attn.num_slots) if self.conf.Models.WorldModel.model == 'OC-irisXL' else get_subsequent_mask_with_batch_length(batch_length, flattened_sample.device)
+    #        dist_feat = self.storm_transformer(flattened_sample, action, temporal_mask, positions) if self.conf.Models.WorldModel.model == 'OC-irisXL' else self.storm_transformer(flattened_sample, action, temporal_mask) 
+    #        if self.conf.Models.WorldModel.stochastic_head:
+    #            prior_logits = self.dist_head.forward_prior(dist_feat)
+    #        # decoding reward and termination with dist_feat
+    #        if self.conf.Models.WorldModel.model=='OC-irisXL':
+    #            slots_hat = self.slots_head(dist_feat)
+    #            combined_dist_feat = rearrange(dist_feat, 'b t s e-> b t (s e)') if self.conf.Models.WorldModel.wm_oc_pool_layer != 'cls-transformer' else dist_feat
+    #            combined_dist_feat = self.wm_oc_pool_layer(combined_dist_feat)
+    #            reward_hat = self.reward_decoder(combined_dist_feat)
+    #            termination_hat = self.termination_decoder(combined_dist_feat)
+    #        else:
+    #            reward_hat = self.reward_decoder(dist_feat)
+    #            termination_hat = self.termination_decoder(dist_feat)
+#
+    #        # DINO losses
+    #        consistency_loss = self.dino.cosine_loss(attns) if self.conf.Models.WorldModel.model == 'OC-irisXL' else 0
+    #        dino_reconstruction_loss = torch.pow(z_vit - reconstructions, 2).mean() if self.conf.Models.WorldModel.model == 'OC-irisXL' else 0
+    #        # decoder losses
+    #        obs_hat = rearrange(obs_hat, '(b t) c h w -> b t c h w', b=batch_size)
+    #        decoder_loss = torch.pow(obs_hat - obs_downsampled, 2).mean() if self.conf.Models.WorldModel.model == 'OC-irisXL' else 0
+    #        dino_loss = dino_reconstruction_loss + consistency_loss if self.conf.Models.WorldModel.model == 'OC-irisXL' else self.mse_loss_func(obs_hat, obs)
+    #        # STORM env losses
+    #        reward_loss = self.symlog_twohot_loss_func(reward_hat, reward)
+    #        termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
+    #        slots_loss = F.mse_loss(embedding.detach(), slots_hat)
+    #        # dyn-rep loss
+    #        
+    #        wm_loss = reward_loss + slots_loss + termination_loss 
+    #        total_loss = dino_loss + decoder_loss + wm_loss
+    #        if self.conf.Models.WorldModel.stochastic_head:
+    #            dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]).detach(), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]))
+    #            representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]).detach())
+    #            total_loss += 0.5*dynamics_loss + 0.1*representation_loss
+#
+    #    # gradient descent
+    #    if self.conf.Models.WorldModel.model=='OC-irisXL':
+    #        # DINO Optimization
+    #        self.scaler.scale(dino_loss).backward()
+    #        self.scaler.unscale_(self.dino_optimizer)  # for clip grad
+    #        torch.nn.utils.clip_grad_norm_(self.dino_parameters, max_norm=1.0)
+    #        self.scaler.step(self.dino_optimizer)
+    #        self.scaler.update()
+    #        self.dino_optimizer.zero_grad(set_to_none=True)
+    #        # DEC Optimization
+    #        self.scaler.scale(decoder_loss).backward()
+    #        self.scaler.unscale_(self.dec_optimizer)  # for clip grad
+    #        torch.nn.utils.clip_grad_norm_(self.dec_parameters, max_norm=1.0)
+    #        self.scaler.step(self.dec_optimizer)
+    #        self.scaler.update()
+    #        self.dec_optimizer.zero_grad(set_to_none=True)
+    #        # WM Optimization
+    #        self.scaler.scale(wm_loss).backward()
+    #        self.scaler.unscale_(self.wm_optimizer)  # for clip grad
+    #        self.scaler.unscale_(self.dec_optimizer)  # for clip grad
+    #        dino_norm = torch.nn.utils.clip_grad_norm_(self.dino_parameters, max_norm=1.0)
+    #        wm_norm = torch.nn.utils.clip_grad_norm_(self.wm_parameters, max_norm=10.0)
+    #        dec_norm = torch.nn.utils.clip_grad_norm_(self.dec_parameters, max_norm=1.0)
+    #        self.scaler.step(self.dino_optimizer)
+    #        self.scaler.step(self.wm_optimizer)
+    #        self.scaler.step(self.dec_optimizer)
+    #        self.scaler.update()
+#
+    #        if self.dino_scheduler is not None:
+    #            self.dino_scheduler.step()
+    #        if self.wm_scheduler is not None:
+    #            self.wm_scheduler.step()
+    #        if self.dec_scheduler is not None:
+    #            self.dec_scheduler.step()
+#
+    #        self.dino_optimizer.zero_grad(set_to_none=True)
+    #        self.wm_optimizer.zero_grad(set_to_none=True)
+    #        self.dec_optimizer.zero_grad(set_to_none=True)
+    #    else:
+    #        self.scaler.scale(total_loss).backward()
+    #        self.scaler.unscale_(self.optimizer)  # for clip grad
+    #        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1000.0)
+    #        self.scaler.step(self.optimizer)
+    #        self.scaler.update()
+    #        self.optimizer.zero_grad(set_to_none=True)
+#
+    #    if logger is not None:
+    #        logger.log("WorldModel/consistency_loss", consistency_loss.item())
+    #        logger.log("WorldModel/dino_reconstruction_loss", dino_reconstruction_loss.item())
+    #        logger.log("WorldModel/decoder_reconstruction_loss", decoder_loss.item())
+    #        logger.log("WorldModel/dino_norm", dino_norm.item())
+    #        logger.log("WorldModel/decoder_norm", dec_norm.item())
+    #        logger.log("WorldModel/reward_loss", reward_loss.item())
+    #        logger.log("WorldModel/slots_loss", slots_loss.item())
+    #        logger.log("WorldModel/termination_loss", termination_loss.item())
+    #        if self.conf.Models.WorldModel.stochastic_head:
+    #            logger.log("WorldModel/dynamics_loss", dynamics_loss.item())
+    #            logger.log("WorldModel/dynamics_real_kl_div", dynamics_real_kl_div.item())
+    #            logger.log("WorldModel/representation_loss", representation_loss.item())
+    #            logger.log("WorldModel/representation_real_kl_div", representation_real_kl_div.item())
+    #        logger.log("WorldModel/total_loss", total_loss.item())
+    #        logger.log("WorldModelNorm/dino_norm", dino_norm.item())
+    #        logger.log("WorldModelNorm/wm_norm", wm_norm.item())
+    #        logger.log("WorldModelNorm/dec_norm", dec_norm.item())
+    #        if log_recs:
+    #            #logger.log("WorldModel/predict_slots_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
+    #            obs_hat_list = self.compute_image_with_slots(obs_downsampled, obs_hat, rearrange(colors, '(b t) s c h w -> b t s c h w', b=batch_size), rearrange(masks, '(b t) s c h w -> b t s c h w', b=batch_size))
+    #            logger.log("DINO/images/predict_slots_recs", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).squeeze(1).cpu().float().detach().numpy(), obs_hat.shape[1])
     
 
     def update_dino(self, obs, action, reward, termination, logger=None, log_recs=False):
-        # self.train()
-
         ###########################
         ###########################
         # train dino
@@ -813,6 +812,10 @@ class WorldModel(nn.Module):
             logger.log("WorldModel/consistency_loss", consistency_loss.item())
             logger.log("WorldModel/dino_reconstruction_loss", dino_reconstruction_loss.item())
             logger.log("WorldModelNorm/dino_norm", dino_norm.item())
+            logs = torch.tensor([consistency_loss.item(), dino_reconstruction_loss.item(), dino_norm.item()])
+            print('DINO logs: ', logs)
+            if (logs == torch.nan).any() or (logs == torch.inf).any() or (logs == -torch.inf).any():
+                print('inf or nan found')
       
         
 
@@ -923,6 +926,10 @@ class WorldModel(nn.Module):
             logger.log("WorldModel/total_loss", total_loss.item())
             logger.log("WorldModelNorm/wm_norm", wm_norm.item())
             logger.log("WorldModelNorm/dec_norm", dec_norm.item())
+            logs = torch.tensor([decoder_loss.item(),reward_loss.item(),slots_loss.item(),termination_loss.item(),wm_norm.item(),dec_norm.item()])
+            print('WM logs: ', logs)            
+            if (logs == torch.nan).any() or (logs == torch.inf).any() or (logs == -torch.inf).any():
+                print('inf or nan found')
           
             if log_recs:
                 #logger.log("WorldModel/predict_slots_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
@@ -981,7 +988,7 @@ class WorldModel(nn.Module):
                     norms.extend([torch.norm(g, norm_type) for g in grads])
 
             total_norm = torch.norm(torch.stack([norm.to(first_device) for norm in norms]), norm_type)
-            print(torch.stack([norm.to(first_device) for norm in norms]))
+            #print(torch.stack([norm.to(first_device) for norm in norms]))
 
         if error_if_nonfinite and torch.logical_or(total_norm.isnan(), total_norm.isinf()):
             raise RuntimeError(
