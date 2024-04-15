@@ -5,6 +5,42 @@ from einops import repeat, rearrange
 import copy
 from sub_models.attention_blocks import get_vector_mask
 from sub_models.attention_blocks import PositionalEncoding1D, AttentionBlock, AttentionBlockKVCache, RelativeMultiheadSelfAttention, PositionalEncoding
+from sub_models.dino_transformer_utils import CrossAttention
+
+
+
+class StateMixer(nn.Module):
+    def __init__(self, z_dim, action_dim, feat_dim, type, num_heads=None):
+        super().__init__() 
+        self.type_mixer = type
+        if self.type_mixer == 'concat':
+            input_dim = z_dim + action_dim
+            self.mha = lambda z, a: z
+        
+        elif self.type_mixer == 'concat+attn':
+            input_dim = z_dim + action_dim
+            self.mha = CrossAttention(num_heads, input_dim, action_dim)
+            
+        elif self.type_mixer == 'z+attn':
+            input_dim = z_dim 
+            self.mha = CrossAttention(num_heads, z_dim, action_dim)
+        else:
+           raise f'Mixer of type {self.type_mixer} not defined, modify config file!'
+    
+        self.mixer = nn.Sequential(
+                nn.Linear(input_dim, feat_dim, bias=False),
+                nn.LayerNorm(feat_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(feat_dim, feat_dim, bias=False),
+                nn.LayerNorm(feat_dim)
+                )
+        
+    def forward(self, z, a):
+        input =  torch.cat([z, a], dim=-1) if 'concat' in self.type_mixer else z
+        h = self.mha(input, a)
+        return self.mixer(h)
+
+
 
 
 class StochasticTransformer(nn.Module):
@@ -105,21 +141,22 @@ class StochasticTransformerKVCache(nn.Module):
 
 class TransformerXL(nn.Module):
 
-    def __init__(self, stoch_dim, action_dim, feat_dim, transformer_layer_config, num_layers, max_length, mem_length, conf=None, batch_first=True, slot_based=True):
+    def __init__(self, stoch_dim, action_dim, feat_dim, transformer_layer_config, num_layers, max_length, mem_length, conf=None, batch_first=True, slot_based=True, mixer_type='concat'):
         super().__init__()
         
         self.action_dim = action_dim
         self.feat_dim = feat_dim
         self.conf = conf
-        input_dim = stoch_dim + self.conf.Models.WorldModel.action_emb_dim
+        
         # mix image_embedding and action
-        self.stem = nn.Sequential(
-            nn.Linear(input_dim, feat_dim, bias=False),
-            nn.LayerNorm(feat_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(feat_dim, feat_dim, bias=False),
-            nn.LayerNorm(feat_dim)
-        )
+        #self.stem = nn.Sequential(
+        #    nn.Linear(input_dim, feat_dim, bias=False),
+        #    nn.LayerNorm(feat_dim),
+        #    nn.ReLU(inplace=True),
+        #    nn.Linear(feat_dim, feat_dim, bias=False),
+        #    nn.LayerNorm(feat_dim)
+        #)
+        self.stem = StateMixer(stoch_dim, self.conf.Models.WorldModel.action_emb_dim, feat_dim, type=mixer_type)
         self.action_embedder = nn.Embedding(action_dim, self.conf.Models.WorldModel.action_emb_dim)
         transformer_layer = TransformerXLDecoderLayer(**transformer_layer_config)
         self.layers = nn.ModuleList([copy.deepcopy(transformer_layer) for _ in range(num_layers)])
@@ -157,7 +194,7 @@ class TransformerXL(nn.Module):
         action = F.one_hot(action.long(), self.action_dim).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=1).float() if self.conf.Models.WorldModel.stochastic_head else self.action_embedder(action.int()).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=1)
         if self.batch_first:
             action = action.transpose(0,1)
-        feats = self.stem(torch.cat([x, action], dim=-1))
+        feats = self.stem(x, action)
         feats = self.layer_norm(feats)
         pos_enc = self.pos_enc(positions)
         hiddens = [feats]
@@ -225,3 +262,64 @@ class TransformerXLDecoderLayer(nn.Module):
         x = self.norm1(x + self.self_attn(x, pos_encodings, u_bias, v_bias, attn_mask, mems))
         x = self.norm2(x + self._ff(x))
         return x
+    
+class TransformerKVCache(nn.Module):
+
+    def __init__(self, stoch_dim, action_dim, feat_dim, transformer_layer_config, num_layers, max_length, mem_length, conf=None, batch_first=True, slot_based=True, mixer_type='concat'):
+    #def __init__(self, stoch_dim, action_dim, feat_dim, num_layers, num_heads, max_length, dropout):
+        super().__init__()
+        self.action_dim = action_dim
+        self.feat_dim = feat_dim
+        self.conf = conf
+        input_dim = stoch_dim + self.conf.Models.WorldModel.action_emb_dim
+        # mix image_embedding and action
+        self.action_embedder = nn.Embedding(action_dim, self.conf.Models.WorldModel.action_emb_dim)
+        self.stem = StateMixer(stoch_dim, self.conf.Models.WorldModel.action_emb_dim, feat_dim, type=mixer_type)
+        self.batch_first = batch_first
+        self.position_encoding = PositionalEncoding1D(max_length=max_length, embed_dim=feat_dim)
+        self.layer_stack = nn.ModuleList([
+            AttentionBlockKVCache(feat_dim=feat_dim, hidden_dim=feat_dim*2, num_heads=transformer_layer_config.num_heads, dropout=transformer_layer_config.dropout_p) for _ in range(num_layers)
+        ])
+        self.layer_norm = nn.LayerNorm(feat_dim, eps=1e-6)  # TODO: check if this is necessary
+
+    def forward(self, samples, action, mask):
+        '''
+        Normal forward pass
+        '''
+        action = self.action_embedder(action.int()).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=1)
+        feats = self.stem(samples, action)
+        feats = self.position_encoding(feats)
+        feats = self.layer_norm(feats)
+
+        for layer in self.layer_stack:
+            feats, attn = layer(feats, feats, feats, mask)
+
+        return feats
+
+    def reset_kv_cache_list(self, batch_size, dtype, device):
+        '''
+        Reset self.kv_cache_list
+        '''
+        self.kv_cache_list = []
+        for layer in self.layer_stack:
+            self.kv_cache_list.append(torch.zeros(size=(batch_size, 0, self.feat_dim), dtype=dtype, device=device))
+
+    def forward_with_kv_cache(self, samples, action):
+        '''
+        Forward pass with kv_cache, cache stored in self.kv_cache_list
+        '''
+        assert samples.shape[1] == 1
+        mask = get_vector_mask(self.kv_cache_list[0].shape[1]+1, samples.device)
+
+        action = F.one_hot(action.long(), self.action_dim).float()
+        feats = self.stem(torch.cat([samples, action], dim=-1))
+        feats = self.position_encoding.forward_with_position(feats, position=self.kv_cache_list[0].shape[1])
+        feats = self.layer_norm(feats)
+
+        for idx, layer in enumerate(self.layer_stack):
+            self.kv_cache_list[idx] = torch.cat([self.kv_cache_list[idx], feats], dim=1)
+            feats, attn = layer(feats, self.kv_cache_list[idx], self.kv_cache_list[idx], mask)
+
+        return feats
+    
+

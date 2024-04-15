@@ -1,4 +1,6 @@
+*.log
 logs/
+.hydra/
 launch.json
 *.pth
 *.pyc

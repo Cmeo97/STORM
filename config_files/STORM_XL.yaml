@@ -14,11 +14,13 @@ BasicSettings:
   pretrained_path: None
 
 
-
+hydra:
+  run:
+    dir: /projects/0/prjs0951/STORM
 
 
 JointTrainAgent:
-  SampleMaxSteps: 142000
+  SampleMaxSteps: 163000
   BufferMaxLength: 100000
   BufferWarmUp: 1024
   NumEnvs: 1
@@ -129,7 +131,7 @@ Models:
     Lambda: 0.95
     EntropyCoef: 3E-4
     pooling_layer: cls-transformer  #cls-transformer dino-sbd
-    state: h
+    state: z
 
   CLSTransformer:
     HiddenDim: 512
