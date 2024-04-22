@@ -1,13 +1,12 @@
 #!/bin/bash
-module load 2023
-module load Miniconda3/23.5.2-0
-conda init
-source activate STORM
-declare -a All_pool_layers=(mlp dino-mlp cls-transformer)
-declare -a All_states=(z h joint)
-declare -a All_env_names=(Boxing Pong)
-declare -a All_seeds=(0)
 
+# Declare variables 
+declare -a All_pool_layers=(dino-mlp)
+declare -a All_states=(joint) # h joint)
+declare -a All_env_names=(Boxing)
+declare -a All_seeds=(2)
+declare -a All_agent_pool_layers=(dino-mlp)
+declare -a All_mixer_types=(concat+attn) # concat concat+attn)
 
 
 
@@ -19,7 +18,13 @@ do
         do
             for seed in "${All_seeds[@]}"
             do
-                sbatch train.sh pool_layer state env_name seed                
+                for agent_pool_layer in "${All_agent_pool_layers[@]}"
+                do
+                    for mixer in "${All_mixer_types[@]}"
+                    do
+                        bash train.sh $pool_layer $state $env_name $seed $agent_pool_layer $mixer  
+                    done
+                done          
             done
         done
     done

@@ -98,7 +98,7 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
                                   batch_size, demonstration_batch_size, batch_length,
                                   imagine_batch_size, imagine_demonstration_batch_size,
                                   imagine_context_length, imagine_batch_length,
-                                  save_every_steps, seed, logger, device, n):
+                                  save_every_steps, seed, logger, device, n, load_trajectory):
     # create ckpt dir
     os.makedirs(f"ckpt/{n}", exist_ok=True)
 
@@ -157,7 +157,8 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
         if replay_buffer.ready():
             context_done.append(done)
 
-        replay_buffer.append(current_obs, action, reward, np.logical_or(done, info["life_loss"]))
+        if not load_trajectory:
+            replay_buffer.append(current_obs, action, reward, np.logical_or(done, info["life_loss"]))
 
         
         if done_flag.any():
@@ -243,6 +244,8 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
                 torch.save(world_model.state_dict(), f"ckpt/{n}/world_model_best.pth")
                 torch.save(agent.state_dict(), f"ckpt/{n}/agent_best.pth")
                 last_reward_best = reward_best
+
+    replay_buffer.save_trajectory(f"trajectories/{n.split('-', 1)[0]}", {})
 
 
 def build_world_model(conf, action_dim, device):
@@ -360,7 +363,8 @@ def main(conf: DictConfig):
             seed=conf.BasicSettings.Seed,
             logger=logger,
             device=conf.BasicSettings.device,
-            n=conf.BasicSettings.n
+            n=conf.BasicSettings.n,
+            load_trajectory=conf.JointTrainAgent.UseDemonstration
         )
     else:
         raise NotImplementedError(f"Task {conf.Task} not implemented")

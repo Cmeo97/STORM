@@ -5,7 +5,7 @@ import torch
 from einops import rearrange
 import copy
 import pickle
-
+import os
 
 class ReplayBuffer():
     def __init__(self, obs_shape, num_envs, max_length=int(1E6), warmup_length=50000, store_on_gpu=False, device='cuda:0') -> None:
@@ -34,7 +34,25 @@ class ReplayBuffer():
             self.external_buffer = {name: torch.from_numpy(buffer[name]).to(device) for name in buffer}
         else:
             self.external_buffer = buffer
-        self.external_buffer_length = self.external_buffer["obs"].shape[0]
+        self.external_buffer_length = self.length = self.external_buffer["obs"].shape[0]
+        print('Trajectory lengh: ', self.external_buffer_length)
+
+    def save_trajectory(self, path, kwargs):
+        
+        obj = {'obs': self.obs_buffer, 'actions': self.action_buffer, 'rewards': self.reward_buffer, 'terminations': self.termination_buffer}
+        kwargs.setdefault('protocol', 4)
+        file = path + '/trajectory.pkl'
+        if not os.path.exists(file):
+            os.makedirs(path)
+        if file is None:
+            return pickle.dumps(obj, **kwargs)
+        elif isinstance(file, str):
+            with open(file, 'wb') as f:
+                pickle.dump(obj, f, **kwargs)
+        elif hasattr(file, 'write'):
+            pickle.dump(obj, file, **kwargs)
+        else:
+            raise TypeError('"file" must be a filename str or a file-object')
 
     def sample_external(self, batch_size, batch_length, device="cuda:0"):
         indexes = np.random.randint(0, self.external_buffer_length+1-batch_length, size=batch_size)
@@ -57,7 +75,7 @@ class ReplayBuffer():
     def sample(self, batch_size, external_batch_size, batch_length, device="cuda:0"):
         if self.store_on_gpu:
             obs, action, reward, termination = [], [], [], []
-            if batch_size > 0:
+            if batch_size > 0 and self.external_buffer_length is None:
                 for i in range(self.num_envs):
                     indexes = np.random.randint(0, self.length+1-batch_length, size=batch_size//self.num_envs)
                     obs.append(torch.stack([self.obs_buffer[idx:idx+batch_length, i] for idx in indexes]))

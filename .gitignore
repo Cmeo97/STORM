@@ -10,3 +10,7 @@ venv/
 *.pt
 outputs/
 *.out
+*.zip
+D_TRAJ/
+*.sh
+trajectories/
