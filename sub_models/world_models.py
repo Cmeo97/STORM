@@ -272,12 +272,12 @@ class SlotsHead(nn.Module):
                 torch.nn.init.kaiming_normal_(m.weight)
                 if m.bias is not None:
                     m.bias.data.fill_(0.01)
-        #self.apply(init_weights)
+        self.apply(init_weights)
 
-    def forward(self, feat):
-        feat = self.backbone(feat)
-        termination = self.head(feat)
-        return termination
+    def forward(self, slots, feat):
+        feat = slots + self.backbone(feat)
+        slots_hat = feat + self.head(feat)
+        return slots_hat
 
 
 class MSELoss(nn.Module):
@@ -474,7 +474,7 @@ class WorldModel(nn.Module):
         rec = rec.reshape(*shape[:-3], *rec.shape[1:])
         return rec
 
-    def calc_last_dist_feat(self, latent, action, termination=None, mems=None, device='cuda:0'):
+    def calc_last_dist_feat(self, slots, latent, action, termination=None, mems=None, device='cuda:0'):
         with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
             if isinstance(self.storm_transformer, StochasticTransformerKVCache):
                 temporal_mask = get_subsequent_mask(latent)
@@ -492,12 +492,12 @@ class WorldModel(nn.Module):
                 if latent.dim() == 5:
                     latent = rearrange(latent, 'b t s e E->b t s (e E)')
                 dist_feat, mems = self.storm_transformer(latent, action, temporal_mask, positions, mems, generation=True)
-                prior_logits = self.dist_head.forward_prior(dist_feat[:, -1:], generation=True) if self.conf.Models.WorldModel.stochastic_head else self.slots_head(dist_feat[:, -1:])
+                prior_logits = self.dist_head.forward_prior(dist_feat[:, -1:], generation=True) if self.conf.Models.WorldModel.stochastic_head else self.slots_head(slots, dist_feat[:, -1:])
                 prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample") if self.conf.Models.WorldModel.stochastic_head else prior_logits
                 prior_flattened_sample = self.flatten_sample(prior_sample) if self.conf.Models.WorldModel.stochastic_head else prior_sample
                 return prior_flattened_sample, dist_feat[:, -1:], mems
 
-    def predict_next(self, last_flattened_sample, action, termination, log_video=True, mems=None, device=None):
+    def predict_next(self, last_flattened_sample, last_slots, action, termination, log_video=True, mems=None, device=None):
         with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
             if isinstance(self.storm_transformer, StochasticTransformerKVCache):
                 dist_feat = self.storm_transformer.forward_with_kv_cache(last_flattened_sample, action)
@@ -519,11 +519,11 @@ class WorldModel(nn.Module):
                 prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
                 prior_flattened_sample = self.flatten_sample(prior_sample)
             else:
-                prior_flattened_sample = slots_hat = self.slots_head(dist_feat)
+                prior_flattened_sample = slots_hat = self.slots_head(last_slots, dist_feat)
             
         
             if log_video:
-                slots_hat = self.slots_head(dist_feat[:8])
+                slots_hat = self.slots_head(last_slots[:8], dist_feat[:8])
                 seq_len = slots_hat.shape[1]
                 slots_hat = rearrange(slots_hat, 'b t s e -> (b t) s e')
                 recon, colors, masks = self.image_decoder(slots_hat)
@@ -582,7 +582,7 @@ class WorldModel(nn.Module):
                 latent_size = (imagine_batch_size, imagine_batch_length+1, self.stoch_flattened_dim)
                 hidden_size = (imagine_batch_size, imagine_batch_length+1, self.transformer_hidden_dim)
             scalar_size = (imagine_batch_size, imagine_batch_length)
-            self.latent_buffer = torch.zeros(latent_size, dtype=dtype, device=device)
+            self.slots_hat_buffer = torch.zeros(latent_size, dtype=dtype, device=device)
             self.hidden_buffer = torch.zeros(hidden_size, dtype=dtype, device=device)
             self.action_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
             self.reward_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
@@ -606,27 +606,29 @@ class WorldModel(nn.Module):
             mems = None
         
         for i in range(sample_obs.shape[1]):  # context_length is sample_obs.shape[1]
-            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat, mems = self.predict_next(
-                context_latent[:, i:i+1],
+            last_obs_hat, last_reward_hat, last_termination_hat, last_slots_hat, last_dist_feat, mems = self.predict_next(
+                context_latent[:, i:i+1], # slots after post_forward
+                context_slots[:, i:i+1],
                 sample_action[:, i:i+1],
                 sample_termination[:, i:i+1],
                 log_video=log_video,
                 mems=mems, 
                 device=device
             )
-        self.latent_buffer[:, 0:1] = last_latent   # change initialization of self.latent_buffer
+        self.slots_hat_buffer[:, 0:1] = last_slots_hat
         self.hidden_buffer[:, 0:1] = last_dist_feat
+  
 
         # imagine
         for i in range(imagine_batch_length):
-            action = agent.sample((self.latent_buffer[:, i:i+1], self.hidden_buffer[:, i:i+1]))
+            action = agent.sample((self.slots_hat_buffer[:, i:i+1], self.hidden_buffer[:, i:i+1]))
             self.action_buffer[:, i:i+1] = action
             with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
-                last_flattened_sample = self.dist_head.forward_post(self.latent_buffer[:, i:i+1])
-            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat, mems = self.predict_next(
-                last_flattened_sample, self.action_buffer[:, i:i+1], self.termination_hat_buffer[:, i:i+1] ,log_video=log_video, mems=mems, device=device)
+                last_flattened_sample = self.dist_head.forward_post(self.slots_hat_buffer[:, i:i+1])
+            last_obs_hat, last_reward_hat, last_termination_hat, last_slots_hat, last_dist_feat, mems = self.predict_next(
+                last_flattened_sample, self.slots_hat_buffer[:, i:i+1], self.action_buffer[:, i:i+1], self.termination_hat_buffer[:, i:i+1] ,log_video=log_video, mems=mems, device=device)
 
-            self.latent_buffer[:, i+1:i+2] = last_latent
+            self.slots_hat_buffer[:, i+1:i+2] = last_slots_hat
             self.hidden_buffer[:, i+1:i+2] = last_dist_feat
             self.reward_hat_buffer[:, i:i+1] = last_reward_hat
             self.termination_hat_buffer[:, i:i+1] = last_termination_hat
@@ -644,7 +646,7 @@ class WorldModel(nn.Module):
             obs_hat_list = self.compute_image_with_slots(obs_downsampled, obs_hat, colors_hat, masks_hat)
             logger.log("Imagine/predict_slots_images", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).squeeze(1).cpu().float().detach().numpy(), imagine_batch_length)
 
-        return (self.latent_buffer, self.hidden_buffer), self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer
+        return (self.slots_hat_buffer, self.hidden_buffer), self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer
 
     #def update(self, obs, action, reward, termination, logger=None, log_recs=False):
     #    self.train()
@@ -844,7 +846,7 @@ class WorldModel(nn.Module):
             dist_feat = self.storm_transformer(flattened_sample, action, temporal_mask, positions)
 
             # decoding reward and termination with dist_feat
-            slots_hat = self.slots_head(dist_feat)
+            slots_hat = self.slots_head(embedding.detach(), dist_feat)
             combined_dist_feat = rearrange(dist_feat, 'b t s e-> b t (s e)') if self.conf.Models.WorldModel.wm_oc_pool_layer != 'cls-transformer' and self.conf.Models.WorldModel.wm_oc_pool_layer != 'dino-mlp' else dist_feat
             combined_dist_feat = self.wm_oc_pool_layer(combined_dist_feat)
             reward_hat = self.reward_decoder(combined_dist_feat)
