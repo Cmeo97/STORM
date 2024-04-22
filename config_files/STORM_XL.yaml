@@ -9,14 +9,14 @@ BasicSettings:
   n: Boxing-life_done-wm_2L512D8H-100k-seed1
   config_path: config_files/STORM_XL.yam
   env_name: ALE/Boxing-v5
-  trajectory_path: D_TRAJ/Boxing.pkl
+  trajectory_path: trajectories/Boxing/Boxing.pkl
   device: cuda:0
   pretrained_path: None
 
 
 hydra:
   run:
-    dir: /projects/0/prjs0951/STORM
+    dir: /space/cristianmeo/STORM #/projects/0/prjs0951/STORM
 
 
 JointTrainAgent:
@@ -126,13 +126,13 @@ Models:
     pred_prior_from: last
 
   Agent:
-    NumLayers: 2
+    NumLayers: 3
     HiddenDim: 512
     Gamma: 0.985
     Lambda: 0.95
     EntropyCoef: 3E-4
     pooling_layer: dino-mlp  #cls-transformer dino-sbd
-    state: z
+    state: joint
 
   CLSTransformer:
     HiddenDim: 256

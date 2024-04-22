@@ -275,8 +275,8 @@ class SlotsHead(nn.Module):
         self.apply(init_weights)
 
     def forward(self, slots, feat):
-        feat = slots + self.backbone(feat)
-        slots_hat = feat + self.head(feat)
+        feat = self.backbone(feat)
+        slots_hat = slots + self.head(feat)
         return slots_hat
 
 
@@ -492,7 +492,7 @@ class WorldModel(nn.Module):
                 if latent.dim() == 5:
                     latent = rearrange(latent, 'b t s e E->b t s (e E)')
                 dist_feat, mems = self.storm_transformer(latent, action, temporal_mask, positions, mems, generation=True)
-                prior_logits = self.dist_head.forward_prior(dist_feat[:, -1:], generation=True) if self.conf.Models.WorldModel.stochastic_head else self.slots_head(slots, dist_feat[:, -1:])
+                prior_logits = self.dist_head.forward_prior(dist_feat[:, -1:], generation=True) if self.conf.Models.WorldModel.stochastic_head else self.slots_head(slots[:, -1:], dist_feat[:, -1:])
                 prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample") if self.conf.Models.WorldModel.stochastic_head else prior_logits
                 prior_flattened_sample = self.flatten_sample(prior_sample) if self.conf.Models.WorldModel.stochastic_head else prior_sample
                 return prior_flattened_sample, dist_feat[:, -1:], mems

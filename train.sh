@@ -12,19 +12,19 @@
 
 #Loading modules
 
-module load 2023
-module load Miniconda3/23.5.2-0
-conda init
-source activate STORM
+#module load 2023
+#module load Miniconda3/23.5.2-0
+#conda init
+#source activate STORM
 
 pool_layer=$1
 env_name=$3
-device=0
+device=2
 seed=$4
 agent_pool_layer=$5
 state=$2
 mixer_type=$6
-exp_name=${env_name}-life_done-wm_2L512D8H-100k-seed_${seed}_${pool_layer}_state_${state}_agent_pool_layer_${agent_pool_layer}_mixer_${mixer_type}
+exp_name=${env_name}-life_done-wm_2L512D8H-100k-seed_${seed}_${pool_layer}_state_${state}_agent_pool_layer_${agent_pool_layer}_mixer_${mixer_type}_residual_head
 nohup python train.py \
 BasicSettings.n=${exp_name} \
 BasicSettings.Seed=${seed} \
