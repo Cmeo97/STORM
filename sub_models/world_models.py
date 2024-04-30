@@ -152,7 +152,7 @@ class DistHead(nn.Module):
                 torch.nn.init.kaiming_normal_(m.weight)
                 if m.bias is not None:
                     m.bias.data.fill_(0.01)
-        #self.apply(init_weights)
+        self.apply(init_weights)
 
     def unimix(self, logits, mixing_ratio=0.01):
         # uniform noise mixing
@@ -163,22 +163,36 @@ class DistHead(nn.Module):
 
     def forward_post(self, x):
         logits = self.post_head(x)
-        logits = rearrange(logits, "B L S (K C) -> B L S K C", K=self.stoch_dim)
+        logits = rearrange(logits, "B L (K C) -> B L K C", K=self.stoch_dim)
         logits = self.unimix(logits)
         return logits
 
-    def forward_prior(self, x, generation=False):
+    def forward_prior(self, x):
         logits = self.prior_head(x)
-        if generation:
-            logits = rearrange(logits, "B L S (K C) -> B L S K C", K=self.stoch_dim)
-        else:
-            if logits.dim() == 4:
-                logits = rearrange(logits, "B L S (K C) -> B L S K C", K=self.stoch_dim)
-            else:
-                logits = rearrange(logits, "B L (K C) -> B L K C", K=self.stoch_dim)
-
+        logits = rearrange(logits, "B L (K C) -> B L K C", K=self.stoch_dim)
         logits = self.unimix(logits)
         return logits
+
+    #def forward_post(self, x):
+    #    logits = self.post_head(x)
+    #    logits = rearrange(logits, "B L S (K C) -> B L S K C", K=self.stoch_dim)
+    #    logits = self.unimix(logits)
+    #    return logits
+
+
+    # USED for OC representations, deprecated --> look at OCDistHead
+    #def forward_prior(self, x, generation=False):  
+    #    logits = self.prior_head(x)
+    #    if generation:
+    #        logits = rearrange(logits, "B L S (K C) -> B L S K C", K=self.stoch_dim)
+    #    else:
+    #        if logits.dim() == 4:
+    #            logits = rearrange(logits, "B L S (K C) -> B L S K C", K=self.stoch_dim)
+    #        else:
+    #            logits = rearrange(logits, "B L (K C) -> B L K C", K=self.stoch_dim)
+#
+    #    logits = self.unimix(logits)
+    #    return logits
 
 class OCDistHead(nn.Module):
     '''
@@ -188,15 +202,15 @@ class OCDistHead(nn.Module):
         super().__init__()
         self.stoch_dim = stoch_dim
         self.post_head = nn.Linear(image_feat_dim, stoch_dim*stoch_dim)
-        self.prior_head = nn.Linear(transformer_hidden_dim, stoch_dim*stoch_dim)
+        #self.prior_head = nn.Linear(transformer_hidden_dim, stoch_dim*stoch_dim)
 
     def forward_post(self, x):
         logits = self.post_head(x)
         return logits
 
-    def forward_prior(self, x, generation=False):
-        logits = self.prior_head(x)
-        return logits
+    #def forward_prior(self, x, generation=False):
+    #    logits = self.prior_head(x)
+    #    return logits
 
 
 class RewardDecoder(nn.Module):
@@ -279,6 +293,30 @@ class SlotsHead(nn.Module):
         slots_hat = slots + self.head(feat)
         return slots_hat
 
+class DinoHead(nn.Module):
+    def __init__(self,  embedding_size, transformer_hidden_dim) -> None:
+        super().__init__()
+        self.backbone = nn.Sequential(
+            nn.Linear(transformer_hidden_dim, transformer_hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(transformer_hidden_dim, transformer_hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(transformer_hidden_dim, embedding_size),
+        )
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                torch.nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    m.bias.data.fill_(0.01)
+        self.apply(init_weights)
+
+    def forward(self, feat):
+        feat = self.backbone(feat)
+        z_vit_hat = self.head(feat)
+        return z_vit_hat
+
 
 class MSELoss(nn.Module):
     def __init__(self) -> None:
@@ -348,7 +386,7 @@ class WorldModel(nn.Module):
             )
             if conf.Models.WorldModel.stochastic_head:
                 self.dist_head = DistHead(
-                    image_feat_dim=conf.Models.Slot_attn.token_dim,
+                    image_feat_dim=conf.Models.Decoder.dec_input_dim,
                     transformer_hidden_dim=transformer_hidden_dim,
                     stoch_dim=self.stoch_dim
                 )
@@ -397,6 +435,103 @@ class WorldModel(nn.Module):
             self.wm_scheduler = None
             self.dec_scheduler = None
 
+
+        elif conf.Models.WorldModel.model == 'Asymmetric-OC-STORM':
+            decoder_config = conf.Models.Decoder
+            slot_attn_config = conf.Models.Slot_attn
+            self.dino = DinoSAM_OCextractor(conf.Models.WorldModel, decoder_config, slot_attn_config)
+            
+            self.continuos_storm_transformer = StochasticTransformerKVCache(
+                stoch_dim=self.stoch_flattened_dim,
+                action_dim=action_dim,
+                feat_dim=transformer_hidden_dim,
+                num_layers=transformer_num_layers,
+                num_heads=transformer_num_heads,
+                max_length=transformer_max_length,
+                dropout=0.1,
+                continuos=True,
+                mixer_type=conf.Models.WorldModel.mixer_type
+            )
+
+            self.discrete_storm_transformer = StochasticTransformerKVCache(
+                stoch_dim=self.stoch_flattened_dim,
+                action_dim=action_dim,
+                feat_dim=transformer_hidden_dim,
+                num_layers=transformer_num_layers,
+                num_heads=transformer_num_heads,
+                max_length=transformer_max_length,
+                dropout=0.1,
+                continuos=False,
+                mixer_type=conf.Models.WorldModel.mixer_type
+            )
+
+            self.image_decoder = SpatialBroadcastDecoder(
+                resolution=conf.Models.Decoder.resolution, 
+                dec_input_dim=conf.Models.Decoder.dec_input_dim,
+                dec_hidden_dim=conf.Models.Decoder.dec_hidden_dim,
+                out_ch=conf.Models.Decoder.out_ch
+            )
+           
+            self.dist_head = DistHead(
+                image_feat_dim=conf.Models.Decoder.dec_input_dim,
+                transformer_hidden_dim=transformer_hidden_dim,
+                stoch_dim=self.stoch_dim
+            )
+            
+            self.oc_dist_head = OCDistHead(
+                image_feat_dim=conf.Models.Slot_attn.token_dim,
+                transformer_hidden_dim=transformer_hidden_dim,
+                stoch_dim=self.stoch_dim
+            )
+            
+            #if conf.Models.WorldModel.wm_oc_pool_layer == 'cls-transformer':
+            #    self.wm_oc_pool_layer = TransformerWithCLS(transformer_hidden_dim, transformer_hidden_dim, self.conf.Models.CLSTransformer.NumHeads, self.conf.Models.CLSTransformer.NumLayers)
+            #elif conf.Models.WorldModel.wm_oc_pool_layer == 'dino-mlp':
+            #    self.wm_oc_pool_layer = BroadcastPoolLayer(transformer_hidden_dim, [transformer_hidden_dim, transformer_hidden_dim], transformer_hidden_dim)
+            #else:
+            #    self.wm_oc_pool_layer = nn.Sequential(
+            #        nn.Linear(self.conf.Models.Slot_attn.num_slots*transformer_hidden_dim, transformer_hidden_dim, bias=False),
+            #        nn.LayerNorm(transformer_hidden_dim),
+            #        nn.ReLU()
+            #        )
+                
+            self.dino_head = DinoHead(
+                embedding_size=conf.Models.Decoder.dec_input_dim,
+                transformer_hidden_dim=transformer_hidden_dim
+            )
+            self.continuos_reward_decoder = RewardDecoder(
+                num_classes=255,
+                embedding_size=transformer_hidden_dim,
+                transformer_hidden_dim=transformer_hidden_dim
+            )
+            self.continuos_termination_decoder = TerminationDecoder(
+                embedding_size=transformer_hidden_dim,
+                transformer_hidden_dim=transformer_hidden_dim
+            )
+            self.discrete_reward_decoder = RewardDecoder(
+                num_classes=255,
+                embedding_size=transformer_hidden_dim,
+                transformer_hidden_dim=transformer_hidden_dim
+            )
+            self.discrete_termination_decoder = TerminationDecoder(
+                embedding_size=transformer_hidden_dim,
+                transformer_hidden_dim=transformer_hidden_dim
+            )
+            
+            self.downsample = Resize(size=(conf.Models.Decoder.resolution, conf.Models.Decoder.resolution))
+            self.dino_parameters = list(self.dino.parameters()) 
+            self.continuos_wm_parameters = list(self.continuos_storm_transformer.parameters()) + list(self.dino_head.parameters()) + list(self.continuos_termination_decoder.parameters()) + list(self.continuos_reward_decoder.parameters()) + list(self.oc_dist_head.parameters()) 
+            self.discrete_wm_parameters = list(self.discrete_storm_transformer.parameters()) + list(self.discrete_termination_decoder.parameters()) + list(self.discrete_reward_decoder.parameters()) + list(self.dist_head.parameters()) 
+            # Indexes of parameters list: idx0-idx1 related module |0-54 wm | 55-81 pool_layer | 82-85 slots_head | 86-93 termination_decoder | 94-101 reward_decoder | 102-106 dist_head 
+            self.dec_parameters = list(self.image_decoder.parameters())
+            self.dino_optimizer = torch.optim.Adam(self.dino_parameters, lr=0.0002)
+            self.continuos_wm_optimizer = torch.optim.Adam(self.continuos_wm_parameters, lr=1e-4)
+            self.discrete_wm_optimizer = torch.optim.Adam(self.discrete_wm_parameters, lr=1e-4)
+            self.dec_optimizer = torch.optim.Adam(self.dec_parameters, lr=0.0002)
+
+            self.dino_scheduler = torch.optim.lr_scheduler.LambdaLR(self.dino_optimizer, lr_lambda=linear_warmup_exp_decay(10000, 0.5, 100000))
+            self.wm_scheduler = None
+            self.dec_scheduler = None
         else:
             self.encoder = EncoderBN(
                 in_channels=in_channels,
@@ -459,6 +594,13 @@ class WorldModel(nn.Module):
                 post_logits = self.dist_head.forward_post(slots) 
                 sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample") if self.conf.Models.WorldModel.stochastic_head else post_logits
                 return slots, sample, attns, z_vit
+        elif self.conf.Models.WorldModel.model=='Asymmetric-OC-STORM':
+            with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
+                _, _, z_vit = self.dino.dino_encode(obs) 
+                post_logits = self.dist_head.forward_post(z_vit)
+                sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
+                flattened_sample = self.flatten_sample(sample)
+            return flattened_sample
         else:
             with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
                 embedding = self.encoder(obs)
@@ -474,16 +616,24 @@ class WorldModel(nn.Module):
         rec = rec.reshape(*shape[:-3], *rec.shape[1:])
         return rec
 
-    def calc_last_dist_feat(self, slots, latent, action, termination=None, mems=None, device='cuda:0'):
+    def calc_last_dist_feat(self, latent, action, slots=None, termination=None, mems=None, device='cuda:0'):
         with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
-            if isinstance(self.storm_transformer, StochasticTransformerKVCache):
+            if conf.Models.WorldModel.model == 'STORM':
                 temporal_mask = get_subsequent_mask(latent)
                 dist_feat = self.storm_transformer(latent, action, temporal_mask)
                 prior_logits = self.dist_head.forward_prior(dist_feat[:, -1:]) 
                 prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
                 prior_flattened_sample = self.flatten_sample(prior_sample)
                 return prior_flattened_sample, dist_feat[:, -1:]
-            else:
+            elif conf.Models.WorldModel.model == 'Asymmetric-OC-STORM':
+                src_length = tgt_length = latent.shape[1]
+                temporal_mask = get_causal_mask(src_length, tgt_length, device, torch.tensor(termination).t().to(device), slot_based=False, generation=True)
+                dist_feat = self.discrete_storm_transformer(latent, action, temporal_mask)
+                prior_logits = self.dist_head.forward_prior(dist_feat[:, -1:]) # Change with MaskGIT 
+                prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
+                prior_flattened_sample = self.flatten_sample(prior_sample)
+                return prior_flattened_sample, dist_feat[:, -1:]
+            elif conf.Models.WorldModel.model == 'OC-irisXL':
                 src_length = tgt_length = latent.shape[1] * self.conf.Models.Slot_attn.num_slots
                 src_length = src_length + mems[0].shape[0] if mems is not None else src_length
                 sequence_length = latent.shape[1] + mems[0].shape[0]/self.conf.Models.Slot_attn.num_slots 
@@ -497,11 +647,16 @@ class WorldModel(nn.Module):
                 prior_flattened_sample = self.flatten_sample(prior_sample) if self.conf.Models.WorldModel.stochastic_head else prior_sample
                 return prior_flattened_sample, dist_feat[:, -1:], mems
 
-    def predict_next(self, last_flattened_sample, last_slots, action, termination, log_video=True, mems=None, device=None):
+    def predict_next(self, last_flattened_sample, last_slots, action, termination, log_video=True, mems=None, device=None, context=False):
         with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
-            if isinstance(self.storm_transformer, StochasticTransformerKVCache):
+            if self.conf.Models.WorldModel.model == 'STORM':
                 dist_feat = self.storm_transformer.forward_with_kv_cache(last_flattened_sample, action)
-            else:
+            elif conf.Models.WorldModel.model == 'Asymmetric-OC-STORM':
+                if context:
+                    pass
+                else:
+                    pass
+            elif self.conf.Models.WorldModel.model == 'OC-irisXL':
                 src_length = last_flattened_sample.shape[1] * self.conf.Models.Slot_attn.num_slots
                 src_length = src_length + mems[0].shape[0] if mems is not None else src_length
                 sequence_length = last_flattened_sample.shape[1] + mems[0].shape[0]/self.conf.Models.Slot_attn.num_slots if mems is not None else last_flattened_sample.shape[1]
@@ -523,14 +678,19 @@ class WorldModel(nn.Module):
             
         
             if log_video:
-                slots_hat = self.slots_head(last_slots[:8], dist_feat[:8])
-                seq_len = slots_hat.shape[1]
-                slots_hat = rearrange(slots_hat, 'b t s e -> (b t) s e')
-                recon, colors, masks = self.image_decoder(slots_hat)
-                recon = rearrange(recon, '(b t) c h w -> b t c h w', t=seq_len)
-                colors = rearrange(colors, '(b t) k c h w -> b t k c h w', t=seq_len)
-                masks = rearrange(masks, '(b t) k c h w -> b t k c h w', t=seq_len)
-                output_hat = recon, colors, masks
+                if self.conf.Models.WorldModel.model == 'OC-irisXL':
+                    slots_hat = self.slots_head(last_slots[:8], dist_feat[:8])
+                    seq_len = slots_hat.shape[1]
+                    slots_hat = rearrange(slots_hat, 'b t s e -> (b t) s e')
+                    recon, colors, masks = self.image_decoder(slots_hat)
+                    recon = rearrange(recon, '(b t) c h w -> b t c h w', t=seq_len)
+                    colors = rearrange(colors, '(b t) k c h w -> b t k c h w', t=seq_len)
+                    masks = rearrange(masks, '(b t) k c h w -> b t k c h w', t=seq_len)
+                    output_hat = recon, colors, masks
+                else:
+                    tokens_sampled = self.dist_head.forward_prior(discrete_dist_feat) 
+
+
             else:
                 output_hat = None
             
@@ -588,6 +748,103 @@ class WorldModel(nn.Module):
             self.reward_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
             self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
 
+
+    def init_imagine_asymmetric_buffer(self, imagine_batch_size, imagine_batch_length, dtype, device):
+        '''
+        This can slightly improve the efficiency of imagine_data
+        But may vary across different machines
+        '''
+        if self.imagine_batch_size != imagine_batch_size or self.imagine_batch_length != imagine_batch_length:
+            print(f"init_imagine_buffer: {imagine_batch_size}x{imagine_batch_length}@{dtype}")
+            self.imagine_batch_size = imagine_batch_size
+            self.imagine_batch_length = imagine_batch_length
+            latent_size = (imagine_batch_size, imagine_batch_length+1, self.stoch_flattened_dim)
+            hidden_size = (imagine_batch_size, imagine_batch_length+1, self.transformer_hidden_dim)
+            scalar_size = (imagine_batch_size, imagine_batch_length)
+            self.latent_buffer = torch.zeros(latent_size, dtype=dtype, device=device)
+            self.hidden_buffer = torch.zeros(hidden_size, dtype=dtype, device=device)
+            self.action_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
+            self.reward_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
+            self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
+
+
+    def imagine_asymmetric_data(self, agent: agents.ActorCriticAgent, sample_obs, sample_action, sample_termination,
+                     imagine_batch_size, imagine_batch_length, log_video, logger, device):
+        self.init_imagine_asymmetric_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype, device=device)
+        obs_hat_list, colors_hat_list, masks_hat_list = [], [], []
+        if log_video:
+            sample_obs, obs_gt = torch.chunk(sample_obs, 2, 1)
+       
+        if isinstance(self.storm_transformer, StochasticTransformerKVCache):
+            self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype, device=device)
+        # context: NEED TO BE FIXED, SHOULD USE CONTINUOS TRANSFORMER
+        with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
+            with torch.no_grad():
+                context_embedding, _, context_z_vit = self.dino.dino_encode(sample_obs)
+                context_continuos_input = self.oc_dist_head.forward_post(context_embedding)
+
+     
+        for i in range(sample_obs.shape[1]):  # context_length is sample_obs.shape[1]
+            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat, mems = self.predict_next(
+                context_latent[:, i:i+1], # slots after post_forward
+                context_continuos_input[:, i:i+1],
+                sample_action[:, i:i+1],
+                sample_termination[:, i:i+1],
+                log_video=log_video,
+                context=True
+            )
+        self.latent_buffer[:, 0:1] = last_latent
+        self.hidden_buffer[:, 0:1] = last_dist_feat
+  
+
+        ## TRANSFER KV CACHE BETWEEN TRANSFORMER, MAYBE ADD FIRST ITERATION DISCRETE TRANSFORMER 
+
+        # imagine
+        #for i in range(imagine_batch_length):
+        #    action = agent.sample((self.slots_hat_buffer[:, i:i+1], self.hidden_buffer[:, i:i+1]))
+        #    self.action_buffer[:, i:i+1] = action
+        #    with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
+        #        last_flattened_sample = self.dist_head.forward_post(self.slots_hat_buffer[:, i:i+1])
+        #    last_obs_hat, last_reward_hat, last_termination_hat, last_slots_hat, last_dist_feat, mems = self.predict_next(
+        #        last_flattened_sample, self.slots_hat_buffer[:, i:i+1], self.action_buffer[:, i:i+1], self.termination_hat_buffer[:, i:i+1] ,log_video=log_video, mems=mems, device=device)
+#
+        #    self.slots_hat_buffer[:, i+1:i+2] = last_slots_hat
+        #    self.hidden_buffer[:, i+1:i+2] = last_dist_feat
+        #    self.reward_hat_buffer[:, i:i+1] = last_reward_hat
+        #    self.termination_hat_buffer[:, i:i+1] = last_termination_hat
+        #    if log_video:
+        #        last_obs_hat, last_colors_hat, last_masks_hat = last_obs_hat
+        #        obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
+        #        colors_hat_list.append(last_colors_hat[::imagine_batch_size//16]) 
+        #        masks_hat_list.append(last_masks_hat[::imagine_batch_size//16]) 
+
+        for i in range(imagine_batch_length):
+            action = agent.sample(torch.cat([self.latent_buffer[:, i:i+1], self.hidden_buffer[:, i:i+1]], dim=-1))
+            self.action_buffer[:, i:i+1] = action
+
+            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat = self.predict_next(
+                self.latent_buffer[:, i:i+1], self.action_buffer[:, i:i+1], log_video=log_video)
+
+            self.latent_buffer[:, i+1:i+2] = last_latent
+            self.hidden_buffer[:, i+1:i+2] = last_dist_feat
+            self.reward_hat_buffer[:, i:i+1] = last_reward_hat
+            self.termination_hat_buffer[:, i:i+1] = last_termination_hat
+            if log_video:
+                obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
+
+        
+        if log_video:
+            obs_hat = torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1)
+            #obs_downsampled = self.downsample(rearrange(obs_gt[:obs_hat_list[0].shape[0]], 'b t c h w->(b t c) h w')).view(*obs_hat.shape)
+            #colors_hat, masks_hat = torch.cat(colors_hat_list, dim=1), torch.cat(masks_hat_list, dim=1)
+            logger.log("Imagine/predict_video", obs_hat.cpu().float().detach().numpy())
+            #obs_hat_list = self.compute_image_with_slots(obs_downsampled, obs_hat, colors_hat, masks_hat)
+            #logger.log("Imagine/predict_slots_images", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).squeeze(1).cpu().float().detach().numpy(), imagine_batch_length)
+
+        return self.latent_buffer, self.hidden_buffer, self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer
+
+    
+
     def imagine_data(self, agent: agents.ActorCriticAgent, sample_obs, sample_action, sample_termination,
                      imagine_batch_size, imagine_batch_length, log_video, logger, device):
         self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype, device=device)
@@ -599,23 +856,24 @@ class WorldModel(nn.Module):
             self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype, device=device)
         # context
         if self.conf.Models.WorldModel.model == 'OC-irisXL':
-            context_slots, context_latent, _, _  = self.encode_obs(sample_obs)
+            context_slots, context_latent, _, context_z_vit = self.encode_obs(sample_obs)
             mems = self.storm_transformer.init_mems()
+        elif self.conf.Models.WorldModel.model == 'Asymmetric-OC-STORM':
+            context_z_vit = self.encode_obs(sample_obs)
+            mems = None
         else:
             context_latent = self.encode_obs(sample_obs)
             mems = None
         
         for i in range(sample_obs.shape[1]):  # context_length is sample_obs.shape[1]
-            last_obs_hat, last_reward_hat, last_termination_hat, last_slots_hat, last_dist_feat, mems = self.predict_next(
+            last_obs_hat, last_reward_hat, last_termination_hat, last_slots, last_dist_feat, mems = self.predict_next(
                 context_latent[:, i:i+1], # slots after post_forward
                 context_slots[:, i:i+1],
                 sample_action[:, i:i+1],
                 sample_termination[:, i:i+1],
-                log_video=log_video,
-                mems=mems, 
-                device=device
+                log_video=log_video
             )
-        self.slots_hat_buffer[:, 0:1] = last_slots_hat
+        self.slots_hat_buffer[:, 0:1] = last_slots
         self.hidden_buffer[:, 0:1] = last_dist_feat
   
 
@@ -819,7 +1077,150 @@ class WorldModel(nn.Module):
             if (logs == torch.nan).any() or (logs == torch.inf).any() or (logs == -torch.inf).any():
                 print('inf or nan found')
       
-        
+
+    def update_asymmetric_wm(self, obs, action, reward, termination, logger=None, log_recs=False):
+        # train wm
+        self.eval()
+        self.dist_head.train()
+        self.storm_transformer.train()
+        self.slots_head.train()
+        self.reward_decoder.train()
+        self.termination_decoder.train()
+        batch_size, batch_length = obs.shape[:2]
+
+        with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
+            with torch.no_grad():
+                embedding, _, z_vit = self.dino.dino_encode(obs)
+
+            post_logits = self.dist_head.forward_post(z_vit) 
+            discrete_input = self.flatten_sample(self.stright_throught_gradient(post_logits, sample_mode="random_sample")) 
+            continuos_input = self.oc_dist_head.forward_post(embedding)
+            # continuos transformer
+            history_length = embedding.shape[1]
+            src_length = tgt_length = history_length * self.conf.Models.Slot_attn.num_slots 
+            device = embedding.device
+            #positions = torch.arange(history_length - 1, -1, -1, device=device).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=0).long() if self.conf.Models.WorldModel.slot_based  else torch.arange(src_length - 1, -1, -1, device=device) 
+            temporal_mask = get_causal_mask(src_length, tgt_length, embedding.device, termination, self.conf.Models.Slot_attn.num_slots, slot_based=False)
+            continuos_dist_feat = self.continuos_storm_transformer(continuos_input, action, temporal_mask) 
+
+            # discrete transformer
+            discrete_dist_feat = self.storm_transformer(discrete_input, action, temporal_mask) 
+
+            # decoding reward and termination with dist_feat
+            #slots_hat = self.slots_head(embedding.detach(), continuos_dist_feat)
+            z_vit_hat = self.dino_head(continuos_dist_feat)
+            #combined_dist_feat = rearrange(dist_feat, 'b t s e-> b t (s e)') if self.conf.Models.WorldModel.wm_oc_pool_layer != 'cls-transformer' and self.conf.Models.WorldModel.wm_oc_pool_layer != 'dino-mlp' else dist_feat
+            #combined_dist_feat = self.wm_oc_pool_layer(combined_dist_feat)
+            continuos_reward_hat = self.continuos_reward_decoder(continuos_dist_feat)
+            continuos_termination_hat = self.continuos_termination_decoder(continuos_dist_feat)
+            discrete_reward_hat = self.discrete_reward_decoder(discrete_dist_feat)
+            discrete_termination_hat = self.discrete_termination_decoder(discrete_dist_feat)
+
+            # STORM env losses
+            continuos_reward_loss = self.symlog_twohot_loss_func(continuos_reward_hat, reward)
+            discrete_reward_loss = self.symlog_twohot_loss_func(discrete_reward_hat, reward)
+            continuos_termination_loss = self.bce_with_logits_loss_func(continuos_termination_hat, termination)
+            discrete_termination_loss = self.bce_with_logits_loss_func(discrete_termination_hat, termination)
+
+            continuos_dyn_loss = self.mse_loss_func(z_vit_hat[:, :-1], z_vit[:, 1:])
+
+            #slots_loss = F.mse_loss(embedding.detach(), slots_hat)
+            # dyn-rep loss
+            continuos_wm_loss = continuos_reward_loss + continuos_termination_loss + continuos_dyn_loss
+            discrete_wm_loss = discrete_reward_loss + discrete_termination_loss 
+
+            prior_logits = self.dist_head.forward_prior(discrete_dist_feat)  ## to be replace with maskgit
+            
+            discrete_dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]).detach(), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]))
+            representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]).detach())
+            discrete_wm_loss += 0.5*discrete_dynamics_loss + 0.1*representation_loss
+
+        self.scaler.scale(continuos_wm_loss).backward()
+        self.scaler.unscale_(self.continuos_wm_optimizer)  # for clip grad
+        #trial_norm = self.trial_clip_grad_norm_(self.wm_parameters, max_norm=10.0)
+        continuos_wm_norm = torch.nn.utils.clip_grad_norm_(self.continuos_wm_parameters, max_norm=10.0)
+        self.scaler.step(self.continuos_wm_optimizer)
+        self.scaler.update()
+
+        if self.continuos_wm_scheduler is not None:
+            self.continuos_wm_scheduler.step()
+
+        self.discrete_wm_optimizer.zero_grad(set_to_none=True)
+
+        self.scaler.scale(discrete_wm_loss).backward()
+        self.scaler.unscale_(self.discrete_wm_optimizer)  # for clip grad
+        #trial_norm = self.trial_clip_grad_norm_(self.wm_parameters, max_norm=10.0)
+        discrete_wm_norm = torch.nn.utils.clip_grad_norm_(self.discrete_wm_parameters, max_norm=10.0)
+        self.scaler.step(self.discrete_wm_optimizer)
+        self.scaler.update()
+
+        if self.discrete_wm_scheduler is not None:
+            self.discrete_wm_scheduler.step()
+
+        self.discrete_wm_optimizer.zero_grad(set_to_none=True)
+
+        ###########################
+        ###########################
+        # train decoder
+        self.eval()
+        self.image_decoder.train()
+        batch_size, batch_length = obs.shape[:2]
+
+        with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
+            obs_downsampled = rearrange(self.downsample(rearrange(obs, 'b t c h w -> (b t) c h w')), '(b t) c h w -> b t c h w', b=batch_size)
+            with torch.no_grad():
+                embedding, _, z_vit = self.dino.dino_encode(obs)
+
+            post_logits = self.dist_head.forward_post(z_vit) 
+            discrete_input = self.flatten_sample(self.stright_throught_gradient(post_logits, sample_mode="random_sample")) 
+            # decoding image
+            obs_hat = self.image_decoder(discrete_input)
+            # decoder losses
+            obs_hat = rearrange(obs_hat, '(b t) c h w -> b t c h w', b=batch_size)
+            decoder_loss = self.mse_loss_func(obs_hat, obs)
+ 
+        # gradient descent
+        self.scaler.scale(decoder_loss).backward()
+        self.scaler.unscale_(self.dec_optimizer)  # for clip grad
+        dec_norm = torch.nn.utils.clip_grad_norm_(self.dec_parameters, max_norm=1.0)
+        self.scaler.step(self.dec_optimizer)
+        self.scaler.update()
+
+        if self.dec_scheduler is not None:
+            self.dec_scheduler.step()
+
+        self.dec_optimizer.zero_grad(set_to_none=True)
+
+        total_loss = wm_loss + decoder_loss
+
+        if logger is not None:
+
+            logger.log("WorldModel/decoder_reconstruction_loss", decoder_loss.item())
+            logger.log("WorldModel/continuos_reward_loss", continuos_reward_loss.item())
+            logger.log("WorldModel/discrete_reward_loss", discrete_reward_loss.item())
+            logger.log("WorldModel/continuos_termination_loss", continuos_termination_loss.item())
+            logger.log("WorldModel/discrete_termination_loss", discrete_termination_loss.item())
+            logger.log("WorldModel/continuos_dynamics_loss", continuos_dynamics_loss.item())
+            logger.log("WorldModel/discrete_dynamics_loss", discrete_dynamics_loss.item())
+            logger.log("WorldModel/dynamics_real_kl_div", dynamics_real_kl_div.item())
+            logger.log("WorldModel/representation_loss", representation_loss.item())
+            logger.log("WorldModel/representation_real_kl_div", representation_real_kl_div.item())
+            logger.log("WorldModel/discrete_wm_loss", discrete_wm_loss.item())
+            logger.log("WorldModel/continuos_wm_loss", continuos_wm_loss.item())            
+            logger.log("WorldModel/total_loss", total_loss.item())
+            logger.log("WorldModelNorm/continuos_wm_norm", continuos_wm_norm.item())
+            logger.log("WorldModelNorm/discrete_wm_norm", discrete_wm_norm.item())
+            logger.log("WorldModelNorm/dec_norm", dec_norm.item())
+            logs = torch.tensor([decoder_loss.item(),continuos_reward_loss.item(), discrete_reward_loss.item(),continuos_termination_loss.item(), discrete_termination_loss.item(), discrete_dynamics_loss.item(), continuos_wm_norm.item(), continuos_dynamics_loss.item(), discrete_wm_norm.item(), dynamics_real_kl_div.item(), representation_loss.item(), representation_real_kl_div.item(), dec_norm.item()])
+            print('WM logs: ', logs)            
+            if (logs == torch.nan).any() or (logs == torch.inf).any() or (logs == -torch.inf).any():
+                print('inf or nan found')
+          
+            if log_recs:
+                #logger.log("WorldModel/predict_slots_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
+                obs_hat_list = self.compute_image_with_slots(obs_downsampled, obs_hat, rearrange(colors, '(b t) s c h w -> b t s c h w', b=batch_size), rearrange(masks, '(b t) s c h w -> b t s c h w', b=batch_size))
+                logger.log("DINO/images/predict_slots_recs", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).squeeze(1).cpu().float().detach().numpy(), obs_hat.shape[1])
+
 
     def update_wm(self, obs, action, reward, termination, logger=None, log_recs=False):
         # train wm
@@ -833,17 +1234,18 @@ class WorldModel(nn.Module):
 
         with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
             with torch.no_grad():
-                embedding, _, _ = self.dino.dino_encode(obs)
-            post_logits = self.dist_head.forward_post(embedding)
+                embedding, _, z_vit = self.dino.dino_encode(obs)
+
+            post_logits = self.dist_head.forward_post(z_vit) if self.conf.Models.WorldModel.stochastic_head else self.dist_head.forward_post(embedding)
             flattened_sample = self.flatten_sample(self.stright_throught_gradient(post_logits, sample_mode="random_sample")) if self.conf.Models.WorldModel.stochastic_head else post_logits
 
             # transformer
             history_length = embedding.shape[1]
-            src_length = tgt_length = history_length * self.conf.Models.Slot_attn.num_slots
+            src_length = tgt_length = history_length * self.conf.Models.Slot_attn.num_slots if self.conf.Models.WorldModel.slot_based else history_length 
             device = embedding.device
             positions = torch.arange(history_length - 1, -1, -1, device=device).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=0).long() if self.conf.Models.WorldModel.slot_based  else torch.arange(src_length - 1, -1, -1, device=device) 
-            temporal_mask = get_causal_mask(src_length, tgt_length, embedding.device, termination, self.conf.Models.Slot_attn.num_slots)
-            dist_feat = self.storm_transformer(flattened_sample, action, temporal_mask, positions)
+            temporal_mask = get_causal_mask(src_length, tgt_length, embedding.device, termination, self.conf.Models.Slot_attn.num_slots, slot_based=self.conf.Models.WorldModel.slot_based)
+            dist_feat = self.storm_transformer(flattened_sample, action, temporal_mask, positions) if not isinstance(self.storm_transformer, StochasticTransformerKVCache) else self.storm_transformer(flattened_sample, action, temporal_mask) 
 
             # decoding reward and termination with dist_feat
             slots_hat = self.slots_head(embedding.detach(), dist_feat)

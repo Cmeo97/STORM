@@ -125,6 +125,8 @@ class ActorCriticAgent(nn.Module):
                 else:
                     self.OC_pool_layer_h = BroadcastPoolLayer(feat_dim[1], [conf.Models.WorldModel.TransformerHiddenDim, conf.Models.WorldModel.TransformerHiddenDim], conf.Models.WorldModel.TransformerHiddenDim)
                     actor_feat = critic_feat = self.conf.Models.CLSTransformer.HiddenDim
+        else:
+            actor_feat = critic_feat = feat_dim
             # DINO decode function
             #shape = z.shape  # (..., C, D)
             #z = z.view(-1, *shape[-2:])

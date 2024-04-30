@@ -131,13 +131,19 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
                     model_context_action = torch.Tensor(model_context_action).to(device)
                     if model_name == 'OC-irisXL':
                         slots, context_latent, _, _ = world_model.encode_obs(torch.cat(list(context_obs), dim=1))
-                        prior_flattened_sample, last_dist_feat, mems = world_model.calc_last_dist_feat(slots, context_latent, model_context_action, context_done, mems, device)
+                        prior_flattened_sample, last_dist_feat, mems = world_model.calc_last_dist_feat(context_latent, model_context_action, slots, context_done, mems, device)
+                        action_input = (prior_flattened_sample, last_dist_feat)
+                    elif model_name == 'Asymmetric-OC-STORM':
+                        context_latent = world_model.encode_obs(torch.cat(list(context_obs), dim=1))
+                        prior_flattened_sample, last_dist_feat = world_model.calc_last_dist_feat(context_latent, model_context_action)
+                        action_input = torch.cat([prior_flattened_sample, last_dist_feat], dim=-1) 
                     else:
                         context_latent = world_model.encode_obs(torch.cat(list(context_obs), dim=1))
                         prior_flattened_sample, last_dist_feat = world_model.calc_last_dist_feat(context_latent, model_context_action)
-                    
+                        action_input = torch.cat([prior_flattened_sample, last_dist_feat], dim=-1) 
+
                     action = agent.sample_as_env_action(
-                        (prior_flattened_sample, last_dist_feat),
+                        action_input,
                         greedy=False
                     )
 
@@ -192,7 +198,7 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
                 log_recs=log_recs
             )
         # train world model part >>>
-        if replay_buffer.ready() and total_steps % (train_dynamics_every_steps//num_envs) == 0 and total_steps >= 63000:
+        if replay_buffer.ready() and total_steps % (train_dynamics_every_steps//num_envs) == 0: # and total_steps >= 63000:
             log_recs = True if total_steps % (save_every_steps//num_envs) == 0 else False
             train_world_model_step(
                 replay_buffer=replay_buffer,
@@ -240,7 +246,7 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
             print(colorama.Fore.GREEN + f"Saving model at total steps {total_steps}" + colorama.Style.RESET_ALL)
             torch.save(world_model.state_dict(), f"ckpt/{n}/world_model_last.pth")
             torch.save(agent.state_dict(), f"ckpt/{n}/agent_last.pth")
-            if last_reward_best != reward_best:
+            if last_reward_best < reward_best:
                 torch.save(world_model.state_dict(), f"ckpt/{n}/world_model_best.pth")
                 torch.save(agent.state_dict(), f"ckpt/{n}/agent_best.pth")
                 last_reward_best = reward_best
@@ -249,34 +255,23 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
 
 
 def build_world_model(conf, action_dim, device):
-    if conf.Models.WorldModel.Transformer == 'TransformerKVCache':
-        wm = WorldModel(
-            in_channels=conf.Models.WorldModel.InChannels,
-            action_dim=action_dim,
-            transformer_max_length=conf.Models.WorldModel.TransformerMaxLength,
-            transformer_hidden_dim=conf.Models.WorldModel.TransformerHiddenDim,
-            transformer_num_layers=conf.Models.WorldModel.TransformerNumLayers,
-            transformer_num_heads=conf.Models.WorldModel.TransformerNumHeads,
-            conf=conf,
-        ).to(device)
-    elif conf.Models.WorldModel.Transformer == 'TransformerXL':
-        wm = WorldModel(
-            in_channels=conf.Models.WorldModel.InChannels,
-            action_dim=action_dim,
-            transformer_max_length=conf.Models.WorldModel.TransformerMaxLength,
-            transformer_hidden_dim=conf.Models.WorldModel.TransformerHiddenDim,
-            transformer_num_layers=conf.Models.WorldModel.TransformerNumLayers,
-            transformer_num_heads=conf.Models.WorldModel.TransformerNumHeads,
-            conf=conf,
-        ).to(device)
-    return wm
+    return WorldModel(
+        in_channels=conf.Models.WorldModel.InChannels,
+        action_dim=action_dim,
+        transformer_max_length=conf.Models.WorldModel.TransformerMaxLength,
+        transformer_hidden_dim=conf.Models.WorldModel.TransformerHiddenDim,
+        transformer_num_layers=conf.Models.WorldModel.TransformerNumLayers,
+        transformer_num_heads=conf.Models.WorldModel.TransformerNumHeads,
+        conf=conf,
+    ).to(device)
+    
 
 
 
 def build_agent(conf, action_dim, device, world_model):
-    
+    feat_dim = (conf.Models.CLSTransformer.z_dim, conf.Models.WorldModel.TransformerHiddenDim) if conf.Models.WorldModel.model == 'OC-irisXL' else conf.Models.WorldModel.stochastic_dim*conf.Models.WorldModel.stochastic_dim+conf.Models.WorldModel.TransformerHiddenDim
     return agents.ActorCriticAgent(
-        feat_dim=(conf.Models.CLSTransformer.z_dim, conf.Models.WorldModel.TransformerHiddenDim),
+        feat_dim=feat_dim,
         num_layers=conf.Models.Agent.NumLayers,
         hidden_dim=conf.Models.Agent.HiddenDim,
         action_dim=action_dim,
@@ -291,7 +286,7 @@ def build_agent(conf, action_dim, device, world_model):
     ).to(device)
 
 
-@hydra.main(config_path="../STORM/config_files", config_name="STORM_XL")
+@hydra.main(config_path="../STORM/config_files", config_name="Asymmetric_STORM") #config_name="STORM_XL")
 def main(conf: DictConfig):  
     # ignore warnings
     

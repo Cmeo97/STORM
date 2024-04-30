@@ -6,7 +6,7 @@ import copy
 from sub_models.attention_blocks import get_vector_mask
 from sub_models.attention_blocks import PositionalEncoding1D, AttentionBlock, AttentionBlockKVCache, RelativeMultiheadSelfAttention, PositionalEncoding
 from sub_models.dino_transformer_utils import CrossAttention
-
+from .dino_transformer_utils import *
 
 
 class StateMixer(nn.Module):
@@ -78,19 +78,26 @@ class StochasticTransformer(nn.Module):
 
 
 class StochasticTransformerKVCache(nn.Module):
-    def __init__(self, stoch_dim, action_dim, feat_dim, num_layers, num_heads, max_length, dropout):
+    def __init__(self, stoch_dim, action_dim, feat_dim, num_layers, num_heads, max_length, dropout, continuos=False, mixer_type='concat'):
         super().__init__()
         self.action_dim = action_dim
         self.feat_dim = feat_dim
-
+        num_head_mixer = 4 if 'attn' in mixer_type else None
+        self.continuos = continuos
+        if continuos:
+            self.wm_oc_pool_layer = BroadcastPoolLayer(feat_dim, [feat_dim, feat_dim], feat_dim)
+            self.action_embedder = nn.Embedding(action_dim, self.conf.Models.WorldModel.action_emb_dim)
+            self.stem = StateMixer(stoch_dim, self.conf.Models.WorldModel.action_emb_dim, feat_dim, type=mixer_type, num_heads=num_head_mixer)
+        else:
+            self.stem = StateMixer(stoch_dim, self.action_dim, feat_dim, type=mixer_type, num_heads=num_head_mixer)
         # mix image_embedding and action
-        self.stem = nn.Sequential(
-            nn.Linear(stoch_dim+action_dim, feat_dim, bias=False),
-            nn.LayerNorm(feat_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(feat_dim, feat_dim, bias=False),
-            nn.LayerNorm(feat_dim)
-        )
+        #self.stem = nn.Sequential(
+        #    nn.Linear(stoch_dim+action_dim, feat_dim, bias=False),
+        #    nn.LayerNorm(feat_dim),
+        #    nn.ReLU(inplace=True),
+        #    nn.Linear(feat_dim, feat_dim, bias=False),
+        #    nn.LayerNorm(feat_dim)
+        #)
         self.position_encoding = PositionalEncoding1D(max_length=max_length, embed_dim=feat_dim)
         self.layer_stack = nn.ModuleList([
             AttentionBlockKVCache(feat_dim=feat_dim, hidden_dim=feat_dim*2, num_heads=num_heads, dropout=dropout) for _ in range(num_layers)
@@ -101,14 +108,15 @@ class StochasticTransformerKVCache(nn.Module):
         '''
         Normal forward pass
         '''
-        action = F.one_hot(action.long(), self.action_dim).float()
-        feats = self.stem(torch.cat([samples, action], dim=-1))
+        action = F.one_hot(action.long(), self.action_dim).float() if not self.continuos else self.action_embedder(action.int()).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=1)
+        feats = self.stem(samples, action)
+        if self.continuos:
+            feats = self.wm_oc_pool_layer(feats)
         feats = self.position_encoding(feats)
         feats = self.layer_norm(feats)
 
         for layer in self.layer_stack:
             feats, attn = layer(feats, feats, feats, mask)
-
         return feats
 
     def reset_kv_cache_list(self, batch_size, dtype, device):
@@ -126,8 +134,10 @@ class StochasticTransformerKVCache(nn.Module):
         assert samples.shape[1] == 1
         mask = get_vector_mask(self.kv_cache_list[0].shape[1]+1, samples.device)
 
-        action = F.one_hot(action.long(), self.action_dim).float()
-        feats = self.stem(torch.cat([samples, action], dim=-1))
+        action = F.one_hot(action.long(), self.action_dim).float() if not self.continuos else self.action_embedder(action.int()).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=1)
+        feats = self.stem(samples, action)
+        if self.continuos:
+            feats = self.wm_oc_pool_layer(feats)
         feats = self.position_encoding.forward_with_position(feats, position=self.kv_cache_list[0].shape[1])
         feats = self.layer_norm(feats)
 

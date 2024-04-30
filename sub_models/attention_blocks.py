@@ -5,6 +5,7 @@ import numpy as np
 from einops import rearrange, repeat
 import math
 from functools import lru_cache
+from PIL import Image
 
 def get_subsequent_mask(seq):
     ''' For masking out the subsequent info. '''
@@ -20,7 +21,30 @@ def get_subsequent_mask_with_batch_length(batch_length, device):
     return subsequent_mask
 
 
-def get_causal_mask(src_length, tgt_length, device, stop_mask, num_current_tokens, mem_num_tokens=0, generation=False, slot_based=True):
+def get_causal_mask(src_length, tgt_length, device, stop_mask, num_current_tokens=0, mem_num_tokens=0, generation=False, slot_based=True):
+
+
+
+    def save_grid_as_png(grid, filename='output.png'): # to test and visualize causal masks
+        """
+        Saves an NxN grid of booleans as a black and white PNG image.
+
+        Parameters:
+        - grid (list of lists or numpy array): The NxN grid of boolean values.
+        - filename (str): The name of the file where the image will be saved.
+        """
+        # Convert the boolean grid to a numpy array if it isn't one already
+        if not isinstance(grid, np.ndarray):
+            grid = np.array(grid)
+
+        # Normalize the boolean values to 0 and 255 (uint8 format)
+        image_data = np.where(grid, 255, 0).astype(np.uint8)
+
+        # Create an image from the array
+        image = Image.fromarray(image_data, 'L')  # 'L' mode for grayscale
+
+        # Save the image
+        image.save(filename)
 
     def _get_base_mask_generation(src_length, tgt_length, device, num_current_tokens, slot_based):
         src_mask = torch.ones(tgt_length, src_length, dtype=torch.bool, device=device)
@@ -52,14 +76,23 @@ def get_causal_mask(src_length, tgt_length, device, stop_mask, num_current_token
     tgt = torch.cummax(tgt, dim=0).values
 
     idx = torch.logical_and(tgt, src)[:-1, :-1] # remove extra dimensions 
-
+    
     i, j, k = idx.shape 
-    if generation:
-        idx = idx.reshape(i, 1, j, 1, k).expand(i, num_current_tokens, j, (num_current_tokens + mem_num_tokens), k) \
-            .reshape(i * num_current_tokens, j * (num_current_tokens + mem_num_tokens), k)
-    else:
-        idx = idx.reshape(i, 1, j, 1, k).expand(i, num_current_tokens, j, (num_current_tokens + min(mem_num_tokens, 1)), k) \
-            .reshape(i * num_current_tokens, j * (num_current_tokens + min(mem_num_tokens, 1)), k)
+    if slot_based:
+        if generation:
+            idx = idx.reshape(i, 1, j, 1, k).expand(i, num_current_tokens, j, (num_current_tokens + mem_num_tokens), k) \
+                .reshape(i * num_current_tokens, j * (num_current_tokens + mem_num_tokens), k)
+        else:
+            idx = idx.reshape(i, 1, j, 1, k).expand(i, num_current_tokens, j, (num_current_tokens + min(mem_num_tokens, 1)), k) \
+                .reshape(i * num_current_tokens, j * (num_current_tokens + min(mem_num_tokens, 1)), k)
+    #else:
+    #    if generation:
+    #        idx = idx.reshape(i, 1, j, 1, k).expand(i, num_current_tokens, j, (num_current_tokens + mem_num_tokens), k) \
+    #            .reshape(i * num_current_tokens, j * (num_current_tokens + mem_num_tokens), k)
+    #    else:
+    #        idx = idx.reshape(i, 1, j, 1, k).expand(i, num_current_tokens, j, (num_current_tokens + min(mem_num_tokens, 1)), k) \
+    #            .reshape(i * num_current_tokens, j * (num_current_tokens + min(mem_num_tokens, 1)), k)
+
         
     
     idx = idx[-tgt_length:, -src_length:]
@@ -67,7 +100,37 @@ def get_causal_mask(src_length, tgt_length, device, stop_mask, num_current_token
     src_mask = src_mask.unsqueeze(-1).tile(1, 1, batch_size)
     src_mask[idx] = True
     del stop_mask_shift_left, stop_mask_shift_right, tril, tgt, idx, src, shifted_tril
+    #save_grid_as_png(src_mask[:,:,0].detach().cpu())
+    if not slot_based:
+        src_mask = src_mask.permute(2,0,1)
+
     return src_mask
+
+
+
+def save_grid_as_png(grid, filename='output.png'): # to test and visualize causal masks
+    """
+    Saves an NxN grid of booleans as a black and white PNG image.
+    
+    Parameters:
+    - grid (list of lists or numpy array): The NxN grid of boolean values.
+    - filename (str): The name of the file where the image will be saved.
+    """
+    # Convert the boolean grid to a numpy array if it isn't one already
+    if not isinstance(grid, np.ndarray):
+        grid = np.array(grid)
+    
+    # Normalize the boolean values to 0 and 255 (uint8 format)
+    image_data = np.where(grid, 255, 0).astype(np.uint8)
+    
+    # Create an image from the array
+    image = Image.fromarray(image_data, 'L')  # 'L' mode for grayscale
+    
+    # Save the image
+    image.save(filename)
+
+
+
 
 def get_vector_mask(batch_length, device):
     mask = torch.ones((1, 1, batch_length), device=device).bool()

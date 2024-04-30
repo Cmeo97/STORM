@@ -7,7 +7,7 @@ BasicSettings:
   dtype: torch.float16
   pretrained: None
   n: Boxing-life_done-wm_2L512D8H-100k-seed1
-  config_path: config_files/STORM_XL.yam
+  config_path: config_files/Asymmetric_STORM.yam
   env_name: ALE/Boxing-v5
   trajectory_path: trajectories/Boxing/Boxing.pkl
   device: cuda:1
@@ -53,7 +53,7 @@ Models:
     embed_pdrop: 0.1
     resid_pdrop: 0.1
     attn_pdrop: 0.1
-    model: 'OC-irisXL'
+    model: 'Asymmetric-OC-STORM'
     continuos_embed_dim: 128
     dyn_num_heads: 4
     dyn_num_layers: 4
@@ -92,7 +92,7 @@ Models:
     vit_feature_level: 12
     independent_modules: True
     stochastic_head: False
-    stochastic_dim: 16  #16*16 = 256
+    stochastic_dim: 32  #16*16 = 256
     action_emb_dim: 128
     wm_oc_pool_layer: dino-mlp 
     mixer_type: z+attn
