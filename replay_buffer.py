@@ -28,8 +28,19 @@ class ReplayBuffer():
         self.warmup_length = warmup_length
         self.external_buffer_length = None
 
-    def load_trajectory(self, path, device):
+    def load_trajectory(self, path, image_size, device):
         buffer = pickle.load(open(path, "rb"))
+        if buffer['obs'].shape[-2] != image_size:
+            try:
+                import cv2
+            except ImportError:
+                raise print(
+                    "opencv is not install, run `pip install gym[other]`"
+                )
+
+            observation = cv2.resize(
+                observation, (image_size, image_size), interpolation=cv2.INTER_AREA
+            )
         if self.store_on_gpu:
             self.external_buffer = {name: torch.from_numpy(buffer[name]).to(device) for name in buffer}
         else:
@@ -38,7 +49,6 @@ class ReplayBuffer():
         print('Trajectory lengh: ', self.external_buffer_length)
 
     def save_trajectory(self, path, kwargs):
-        
         obj = {'obs': self.obs_buffer, 'actions': self.action_buffer, 'rewards': self.reward_buffer, 'terminations': self.termination_buffer}
         kwargs.setdefault('protocol', 4)
         file = path + '/trajectory.pkl'

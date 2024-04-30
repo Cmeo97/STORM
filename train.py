@@ -157,7 +157,7 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
         if replay_buffer.ready():
             context_done.append(done)
 
-        if not load_trajectory:
+        if total_steps > 63000 or not load_trajectory:
             replay_buffer.append(current_obs, action, reward, np.logical_or(done, info["life_loss"]))
 
         
@@ -339,7 +339,7 @@ def main(conf: DictConfig):
         # judge whether to load demonstration trajectory
         if conf.JointTrainAgent.UseDemonstration:
             print(colorama.Fore.MAGENTA + f"loading demonstration trajectory from {conf.BasicSettings.trajectory_path}" + colorama.Style.RESET_ALL)
-            replay_buffer.load_trajectory(path=conf.BasicSettings.trajectory_path, device=conf.BasicSettings.device)
+            replay_buffer.load_trajectory(path=f"trajectories/{conf.BasicSettings.n.split('-', 1)[0]}/trajectory.pkl", image_size=conf.BasicSettings.ImageSize, device=conf.BasicSettings.device)
         # train
         joint_train_world_model_agent(
             model_name=conf.Models.WorldModel.model,
