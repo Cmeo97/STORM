@@ -78,12 +78,13 @@ class StochasticTransformer(nn.Module):
 
 
 class StochasticTransformerKVCache(nn.Module):
-    def __init__(self, stoch_dim, action_dim, feat_dim, num_layers, num_heads, max_length, dropout, continuos=False, mixer_type='concat'):
+    def __init__(self, stoch_dim, action_dim, feat_dim, num_layers, num_heads, max_length, dropout, conf=None, continuos=False, mixer_type='concat'):
         super().__init__()
         self.action_dim = action_dim
         self.feat_dim = feat_dim
         num_head_mixer = 4 if 'attn' in mixer_type else None
         self.continuos = continuos
+        self.conf = conf
         if continuos:
             self.wm_oc_pool_layer = BroadcastPoolLayer(feat_dim, [feat_dim, feat_dim], feat_dim)
             self.action_embedder = nn.Embedding(action_dim, self.conf.Models.WorldModel.action_emb_dim)

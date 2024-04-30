@@ -449,6 +449,7 @@ class WorldModel(nn.Module):
                 num_heads=transformer_num_heads,
                 max_length=transformer_max_length,
                 dropout=0.1,
+                conf=conf,
                 continuos=True,
                 mixer_type=conf.Models.WorldModel.mixer_type
             )
@@ -461,16 +462,25 @@ class WorldModel(nn.Module):
                 num_heads=transformer_num_heads,
                 max_length=transformer_max_length,
                 dropout=0.1,
+                conf=conf,
                 continuos=False,
                 mixer_type=conf.Models.WorldModel.mixer_type
             )
 
-            self.image_decoder = SpatialBroadcastDecoder(
-                resolution=conf.Models.Decoder.resolution, 
-                dec_input_dim=conf.Models.Decoder.dec_input_dim,
-                dec_hidden_dim=conf.Models.Decoder.dec_hidden_dim,
-                out_ch=conf.Models.Decoder.out_ch
+            self.image_decoder = DecoderBN(
+                stoch_dim=self.stoch_flattened_dim,
+                last_channels=self.encoder.last_channels,
+                original_in_channels=in_channels,
+                stem_channels=32,
+                final_feature_width=self.final_feature_width
             )
+
+            #self.image_decoder = SpatialBroadcastDecoder(
+            #    resolution=conf.Models.Decoder.resolution, 
+            #    dec_input_dim=conf.Models.Decoder.dec_input_dim,
+            #    dec_hidden_dim=conf.Models.Decoder.dec_hidden_dim,
+            #    out_ch=conf.Models.Decoder.out_ch
+            #)
            
             self.dist_head = DistHead(
                 image_feat_dim=conf.Models.Decoder.dec_input_dim,
