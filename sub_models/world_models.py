@@ -653,9 +653,18 @@ class WorldModel(nn.Module):
                 dist_feat = self.storm_transformer.forward_with_kv_cache(last_flattened_sample, action)
             elif conf.Models.WorldModel.model == 'Asymmetric-OC-STORM':
                 if context:
-                    pass
+                    continuos_input = self.oc_dist_head.forward_post(last_slots)
+                    # continuos transformer
+                    history_length = embedding.shape[1]
+                    src_length = tgt_length = history_length  
+                    device = embedding.device
+                    #positions = torch.arange(history_length - 1, -1, -1, device=device).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=0).long() if self.conf.Models.WorldModel.slot_based  else torch.arange(src_length - 1, -1, -1, device=device) 
+                    temporal_mask = get_causal_mask(src_length, tgt_length, last_slots.device, termination, self.conf.Models.Slot_attn.num_slots, slot_based=False, generation=True)
+                    dist_feat = self.continuos_storm_transformer(continuos_input, action, temporal_mask) 
                 else:
-                    pass
+                    src_length = last_flattened_sample.shape[1]
+                    temporal_mask = get_causal_mask(src_length, termination, generation=True, slot_based=False)
+                    dist_feat = self.discrete_storm_transformer.forward_with_kv_cache(last_flattened_sample, action, temporal_mask)
             elif self.conf.Models.WorldModel.model == 'OC-irisXL':
                 src_length = last_flattened_sample.shape[1] * self.conf.Models.Slot_attn.num_slots
                 src_length = src_length + mems[0].shape[0] if mems is not None else src_length
@@ -669,15 +678,15 @@ class WorldModel(nn.Module):
             
 
             # decoding
-            if self.conf.Models.WorldModel.stochastic_head:
-                prior_logits = self.dist_head.forward_prior(dist_feat, generation=True)
+            if conf.Models.WorldModel.model == 'Asymmetric-OC-STORM' and not context:
+                prior_logits = self.dist_head.forward_prior(dist_feat, generation=True) ## TO BE Replaced with MASKGIT
                 prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
                 prior_flattened_sample = self.flatten_sample(prior_sample)
-            else:
+            elif self.conf.Models.WorldModel.model == 'OC-irisXL': 
                 prior_flattened_sample = slots_hat = self.slots_head(last_slots, dist_feat)
             
         
-            if log_video:
+            if log_video and not context:
                 if self.conf.Models.WorldModel.model == 'OC-irisXL':
                     slots_hat = self.slots_head(last_slots[:8], dist_feat[:8])
                     seq_len = slots_hat.shape[1]
@@ -688,7 +697,7 @@ class WorldModel(nn.Module):
                     masks = rearrange(masks, '(b t) k c h w -> b t k c h w', t=seq_len)
                     output_hat = recon, colors, masks
                 else:
-                    tokens_sampled = self.dist_head.forward_prior(discrete_dist_feat) 
+                    output_hat = self.image_decoder(prior_flattened_samples)
 
 
             else:
@@ -785,9 +794,9 @@ class WorldModel(nn.Module):
 
      
         for i in range(sample_obs.shape[1]):  # context_length is sample_obs.shape[1]
-            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat, mems = self.predict_next(
-                context_latent[:, i:i+1], # slots after post_forward
+            _, _, _, last_latent, last_dist_feat, _ = self.predict_next(
                 context_continuos_input[:, i:i+1],
+                context_continuos_input[:, i:i+1],  ## not used, but to be consistent with OC-STORMXL we keep it - same in imagine 
                 sample_action[:, i:i+1],
                 sample_termination[:, i:i+1],
                 log_video=log_video,
@@ -822,8 +831,8 @@ class WorldModel(nn.Module):
             action = agent.sample(torch.cat([self.latent_buffer[:, i:i+1], self.hidden_buffer[:, i:i+1]], dim=-1))
             self.action_buffer[:, i:i+1] = action
 
-            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat = self.predict_next(
-                self.latent_buffer[:, i:i+1], self.action_buffer[:, i:i+1], log_video=log_video)
+            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat, _ = self.predict_next(
+                self.latent_buffer[:, i:i+1], self.latent_buffer[:, i:i+1], self.action_buffer[:, i:i+1], log_video=log_video)
 
             self.latent_buffer[:, i+1:i+2] = last_latent
             self.hidden_buffer[:, i+1:i+2] = last_dist_feat
@@ -1097,7 +1106,7 @@ class WorldModel(nn.Module):
             continuos_input = self.oc_dist_head.forward_post(embedding)
             # continuos transformer
             history_length = embedding.shape[1]
-            src_length = tgt_length = history_length * self.conf.Models.Slot_attn.num_slots 
+            src_length = tgt_length = history_length #* self.conf.Models.Slot_attn.num_slots 
             device = embedding.device
             #positions = torch.arange(history_length - 1, -1, -1, device=device).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=0).long() if self.conf.Models.WorldModel.slot_based  else torch.arange(src_length - 1, -1, -1, device=device) 
             temporal_mask = get_causal_mask(src_length, tgt_length, embedding.device, termination, self.conf.Models.Slot_attn.num_slots, slot_based=False)
