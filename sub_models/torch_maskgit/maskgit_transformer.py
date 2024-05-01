@@ -226,7 +226,7 @@ class BroadcastPositionBiases(nn.Module):
         self.shape = shape
         self.dtype = dtype
         embs = [
-            nn.Parameter(torch.randn(32, embed_dim, dtype=self.dtype) * 0.02)
+            nn.Parameter(torch.randn(64, embed_dim, dtype=self.dtype) * 0.02)
             for i in range(1)
         ]
         self.embs = nn.ParameterList(embs)

@@ -92,7 +92,7 @@ Models:
     vit_feature_level: 12
     independent_modules: True
     stochastic_head: False
-    stochastic_dim: 49  #16*16 = 256
+    stochastic_dim: 64  #16*16 = 256
     action_emb_dim: 128
     wm_oc_pool_layer: dino-mlp 
     mixer_type: z+attn
@@ -135,7 +135,7 @@ Models:
     state: joint
 
   MaskGit:
-    VocabSize: 32
+    VocabSize: 64
     VocabDim: 128
     T_revise: 1
     T_draft: 1

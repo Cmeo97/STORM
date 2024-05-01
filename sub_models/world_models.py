@@ -156,7 +156,8 @@ class DistHead(nn.Module):
             nn.GELU(),
             nn.Linear(96, stoch_dim)
         )
-        self.post_post_head = nn.Linear(196, 49)
+        self.post_post_head = nn.Linear(256, stoch_dim)
+        self.post_post_post_head = nn.Linear(stoch_dim * 49, stoch_dim*stoch_dim)
         self.prior_head = nn.Linear(transformer_hidden_dim, stoch_dim*stoch_dim)
         def init_weights(m):
             if isinstance(m, nn.Linear):
@@ -174,8 +175,11 @@ class DistHead(nn.Module):
 
     def forward_post(self, x):
         logits = self.post_head(x)
-        logits = logits.reshape(*logits.shape[:-2], 49, 196)
+        logits = logits.reshape(*logits.shape[:-2], 49, 256)
         logits = self.post_post_head(logits)
+        logits = logits.reshape(*logits.shape[:-2], 49 * self.stoch_dim)
+        logits = self.post_post_post_head(logits)
+        logits = rearrange(logits, "B L (K C) -> B L K C", K=self.stoch_dim)
         logits = self.unimix(logits)
         return logits
 
@@ -454,6 +458,13 @@ class WorldModel(nn.Module):
             decoder_config = conf.Models.Decoder
             slot_attn_config = conf.Models.Slot_attn
             self.dino = DinoSAM_OCextractor(conf.Models.WorldModel, decoder_config, slot_attn_config)
+            self.continuos_wm_scheduler = None
+            self.discrete_wm_scheduler = None
+
+            self.T_draft = conf.Models.MaskGit.T_draft
+            self.T_revise = conf.Models.MaskGit.T_revise
+            self.M = conf.Models.MaskGit.M
+
             
             self.continuos_storm_transformer = StochasticTransformerKVCache(
                 stoch_dim=conf.Models.Slot_attn.token_dim*2,
@@ -486,7 +497,7 @@ class WorldModel(nn.Module):
                 last_channels=512,
                 original_in_channels=in_channels,
                 stem_channels=32,
-                final_feature_width=self.final_feature_width
+                final_feature_width=7 # HACK
             )
 
             #self.image_decoder = SpatialBroadcastDecoder(
@@ -660,14 +671,14 @@ class WorldModel(nn.Module):
 
     def calc_last_dist_feat(self, latent, action, slots=None, termination=None, mems=None, device='cuda:0'):
         with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
-            if conf.Models.WorldModel.model == 'STORM':
+            if self.conf.Models.WorldModel.model == 'STORM':
                 temporal_mask = get_subsequent_mask(latent)
                 dist_feat = self.storm_transformer(latent, action, temporal_mask)
                 prior_logits = self.dist_head.forward_prior(dist_feat[:, -1:]) 
                 prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
                 prior_flattened_sample = self.flatten_sample(prior_sample)
                 return prior_flattened_sample, dist_feat[:, -1:]
-            elif conf.Models.WorldModel.model == 'Asymmetric-OC-STORM':
+            elif self.conf.Models.WorldModel.model == 'Asymmetric-OC-STORM':
                 src_length = tgt_length = latent.shape[1]
                 temporal_mask = get_causal_mask(src_length, tgt_length, device, torch.tensor(termination).t().to(device), slot_based=False, generation=True)
                 dist_feat = self.discrete_storm_transformer(latent, action, temporal_mask)
@@ -679,7 +690,7 @@ class WorldModel(nn.Module):
                 prior_sample = F.one_hot(prior_sample, num_classes=self.stoch_dim).float()
                 prior_flattened_sample = self.flatten_sample(prior_sample)
                 return prior_flattened_sample, dist_feat[:, -1:]
-            elif conf.Models.WorldModel.model == 'OC-irisXL':
+            elif self.conf.Models.WorldModel.model == 'OC-irisXL':
                 src_length = tgt_length = latent.shape[1] * self.conf.Models.Slot_attn.num_slots
                 src_length = src_length + mems[0].shape[0] if mems is not None else src_length
                 sequence_length = latent.shape[1] + mems[0].shape[0]/self.conf.Models.Slot_attn.num_slots 
@@ -697,13 +708,13 @@ class WorldModel(nn.Module):
         with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
             if self.conf.Models.WorldModel.model == 'STORM':
                 dist_feat = self.storm_transformer.forward_with_kv_cache(last_flattened_sample, action)
-            elif conf.Models.WorldModel.model == 'Asymmetric-OC-STORM':
+            elif self.conf.Models.WorldModel.model == 'Asymmetric-OC-STORM':
                 if context:
                     continuos_input = self.oc_dist_head.forward_post(last_slots)
                     # continuos transformer
-                    history_length = embedding.shape[1]
+                    history_length = last_flattened_sample.shape[1]
                     src_length = tgt_length = history_length  
-                    device = embedding.device
+                    device = last_flattened_sample.device
                     #positions = torch.arange(history_length - 1, -1, -1, device=device).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=0).long() if self.conf.Models.WorldModel.slot_based  else torch.arange(src_length - 1, -1, -1, device=device) 
                     temporal_mask = get_causal_mask(src_length, tgt_length, last_slots.device, termination, self.conf.Models.Slot_attn.num_slots, slot_based=False, generation=True)
                     dist_feat = self.continuos_storm_transformer(continuos_input, action, temporal_mask) 
@@ -724,7 +735,7 @@ class WorldModel(nn.Module):
             
 
             # decoding
-            if conf.Models.WorldModel.model == 'Asymmetric-OC-STORM' and not context:
+            if self.conf.Models.WorldModel.model == 'Asymmetric-OC-STORM' and not context:
                 sample_shape=(self.stoch_dim)
                 rdist = rearrange(dist_feat, "B 1 (K C) -> (B 1) K C", K=self.stoch_dim)
                 prior_sample =  self.maskgit.sample(rdist.shape[0], self.T_draft, self.T_revise, self.M, cond=rdist, sample_shape=sample_shape)
@@ -747,7 +758,7 @@ class WorldModel(nn.Module):
                     masks = rearrange(masks, '(b t) k c h w -> b t k c h w', t=seq_len)
                     output_hat = recon, colors, masks
                 else:
-                    output_hat = self.image_decoder(prior_flattened_samples)
+                    output_hat = self.image_decoder(prior_flattened_sample) # HACK
 
 
             else:
@@ -835,7 +846,8 @@ class WorldModel(nn.Module):
             sample_obs, obs_gt = torch.chunk(sample_obs, 2, 1)
        
         if isinstance(self.storm_transformer, StochasticTransformerKVCache):
-            self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype, device=device)
+            self.discrete_storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype, device=device)
+            self.continuos_storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype, device=device)
         # context: NEED TO BE FIXED, SHOULD USE CONTINUOS TRANSFORMER
         with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
             with torch.no_grad():
@@ -843,7 +855,7 @@ class WorldModel(nn.Module):
                 context_continuos_input = self.oc_dist_head.forward_post(context_embedding)
 
      
-        for i in range(sample_obs.shape[1]):  # context_length is sample_obs.shape[1]
+        for i in range(sample_obs.shape[1] - 1):  # context_length is sample_obs.shape[1]
             _, _, _, last_latent, last_dist_feat, _ = self.predict_next(
                 context_continuos_input[:, i:i+1],
                 context_continuos_input[:, i:i+1],  ## not used, but to be consistent with OC-STORMXL we keep it - same in imagine 
@@ -852,6 +864,18 @@ class WorldModel(nn.Module):
                 log_video=log_video,
                 context=True
             )
+        
+        self.discrete_storm_transformer.kv_cache_list = self.continuos_storm_transformer.kv_cache_list
+        _, _, _, last_latent, last_dist_feat, _ = self.predict_next(
+                context_continuos_input[:, sample_obs.shape[1] - 1:sample_obs.shape[1]],
+                context_continuos_input[:, sample_obs.shape[1] - 1:sample_obs.shape[1]],  ## not used, but to be consistent with OC-STORMXL we keep it - same in imagine 
+                sample_action[:, sample_obs.shape[1] - 1:sample_obs.shape[1]],
+                sample_termination[:, sample_obs.shape[1] - 1:sample_obs.shape[1]],
+                log_video=log_video,
+                context=False
+            )
+
+
         self.latent_buffer[:, 0:1] = last_latent
         self.hidden_buffer[:, 0:1] = last_dist_feat
   
@@ -882,7 +906,7 @@ class WorldModel(nn.Module):
             self.action_buffer[:, i:i+1] = action
 
             last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat, _ = self.predict_next(
-                self.latent_buffer[:, i:i+1], self.latent_buffer[:, i:i+1], self.action_buffer[:, i:i+1], log_video=log_video)
+                self.latent_buffer[:, i:i+1], self.latent_buffer[:, i:i+1], self.action_buffer[:, i:i+1], log_video=log_video, context=False)
 
             self.latent_buffer[:, i+1:i+2] = last_latent
             self.hidden_buffer[:, i+1:i+2] = last_dist_feat
@@ -1198,7 +1222,6 @@ class WorldModel(nn.Module):
             # dyn-rep loss
             continuos_wm_loss = continuos_reward_loss + continuos_termination_loss + continuos_dyn_loss
             discrete_wm_loss = discrete_reward_loss + discrete_termination_loss
-
             # chage the shape of dist_feat such that it matches the shape required by maskgit
             discrete_dist_feat = rearrange(discrete_dist_feat, "B L (K C) -> (B L) K C", K=self.stoch_dim)
             sample_encodings = rearrange(sample_encodings, "B L K -> (B L) K")
@@ -1208,10 +1231,12 @@ class WorldModel(nn.Module):
             z_labels = rearrange(z_labels, "(B L) K C -> B L K C", B=batch_size) # bring back to original shape
             z_mask = rearrange(z_mask, "(B L) K -> B L K", B=batch_size) # bring back to original shape
             discrete_dist_feat = rearrange(discrete_dist_feat, "(B L) K C -> B L (K C)", B=batch_size) # bring back to original shape
+            print(f"z_logits: {z_logits.shape}, z_labels: {z_labels.shape}, z_mask: {z_mask.shape}, discrete_dist_feat: {discrete_dist_feat.shape}")
+            print(post_logits.shape)
 
             
-            discrete_dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]).detach(), z_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]), z_mask[:, :-1].reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]))
-            representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]), z_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]).detach(), z_mask[:, :-1].reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]).detach())
+            discrete_dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].detach(), z_logits[:, :-1], z_mask[:, :-1])
+            representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:], z_logits[:, :-1].detach(), z_mask[:, :-1].detach())
             discrete_wm_loss += 0.5*discrete_dynamics_loss + 0.1*representation_loss
 
         self.scaler.scale(continuos_wm_loss).backward()
@@ -1221,7 +1246,7 @@ class WorldModel(nn.Module):
         self.scaler.step(self.continuos_wm_optimizer)
         self.scaler.update()
 
-        if self.continuos_wm_scheduler is not None:
+        if self.continuos_wm_scheduler is not None: #TODO: currently this is None
             self.continuos_wm_scheduler.step()
 
         self.discrete_wm_optimizer.zero_grad(set_to_none=True)
@@ -1233,7 +1258,7 @@ class WorldModel(nn.Module):
         self.scaler.step(self.discrete_wm_optimizer)
         self.scaler.update()
 
-        if self.discrete_wm_scheduler is not None:
+        if self.discrete_wm_scheduler is not None: #TODO: currently this is None
             self.discrete_wm_scheduler.step()
 
         self.discrete_wm_optimizer.zero_grad(set_to_none=True)
@@ -1255,7 +1280,7 @@ class WorldModel(nn.Module):
             # decoding image
             obs_hat = self.image_decoder(discrete_input)
             # decoder losses
-            obs_hat = rearrange(obs_hat, '(b t) c h w -> b t c h w', b=batch_size)
+            #obs_hat = rearrange(obs_hat, '(b t) c h w -> b t c h w', b=batch_size)
             decoder_loss = self.mse_loss_func(obs_hat, obs)
  
         # gradient descent
@@ -1270,6 +1295,7 @@ class WorldModel(nn.Module):
 
         self.dec_optimizer.zero_grad(set_to_none=True)
 
+        wm_loss = continuos_wm_loss + discrete_wm_loss # HACK
         total_loss = wm_loss + decoder_loss
 
         if logger is not None:
@@ -1279,7 +1305,7 @@ class WorldModel(nn.Module):
             logger.log("WorldModel/discrete_reward_loss", discrete_reward_loss.item())
             logger.log("WorldModel/continuos_termination_loss", continuos_termination_loss.item())
             logger.log("WorldModel/discrete_termination_loss", discrete_termination_loss.item())
-            logger.log("WorldModel/continuos_dynamics_loss", continuos_dynamics_loss.item())
+            logger.log("WorldModel/continuos_dynamics_loss", continuos_dyn_loss.item())
             logger.log("WorldModel/discrete_dynamics_loss", discrete_dynamics_loss.item())
             logger.log("WorldModel/dynamics_real_kl_div", dynamics_real_kl_div.item())
             logger.log("WorldModel/representation_loss", representation_loss.item())
@@ -1290,15 +1316,16 @@ class WorldModel(nn.Module):
             logger.log("WorldModelNorm/continuos_wm_norm", continuos_wm_norm.item())
             logger.log("WorldModelNorm/discrete_wm_norm", discrete_wm_norm.item())
             logger.log("WorldModelNorm/dec_norm", dec_norm.item())
-            logs = torch.tensor([decoder_loss.item(),continuos_reward_loss.item(), discrete_reward_loss.item(),continuos_termination_loss.item(), discrete_termination_loss.item(), discrete_dynamics_loss.item(), continuos_wm_norm.item(), continuos_dynamics_loss.item(), discrete_wm_norm.item(), dynamics_real_kl_div.item(), representation_loss.item(), representation_real_kl_div.item(), dec_norm.item()])
+            logs = torch.tensor([decoder_loss.item(),continuos_reward_loss.item(), discrete_reward_loss.item(),continuos_termination_loss.item(), discrete_termination_loss.item(), discrete_dynamics_loss.item(), continuos_wm_norm.item(), continuos_dyn_loss.item(), discrete_wm_norm.item(), dynamics_real_kl_div.item(), representation_loss.item(), representation_real_kl_div.item(), dec_norm.item()])
             print('WM logs: ', logs)            
             if (logs == torch.nan).any() or (logs == torch.inf).any() or (logs == -torch.inf).any():
                 print('inf or nan found')
-          
-            if log_recs:
+
+            #HACK
+            #if log_recs:
                 #logger.log("WorldModel/predict_slots_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
-                obs_hat_list = self.compute_image_with_slots(obs_downsampled, obs_hat, rearrange(colors, '(b t) s c h w -> b t s c h w', b=batch_size), rearrange(masks, '(b t) s c h w -> b t s c h w', b=batch_size))
-                logger.log("DINO/images/predict_slots_recs", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).squeeze(1).cpu().float().detach().numpy(), obs_hat.shape[1])
+                #obs_hat_list = self.compute_image_with_slots(obs_downsampled, obs_hat, rearrange(colors, '(b t) s c h w -> b t s c h w', b=batch_size), rearrange(masks, '(b t) s c h w -> b t s c h w', b=batch_size))
+                #logger.log("DINO/images/predict_slots_recs", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).squeeze(1).cpu().float().detach().numpy(), obs_hat.shape[1])
 
 
     def update_wm(self, obs, action, reward, termination, logger=None, log_recs=False):

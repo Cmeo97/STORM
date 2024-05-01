@@ -135,7 +135,7 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
                         action_input = (prior_flattened_sample, last_dist_feat)
                     elif model_name == 'Asymmetric-OC-STORM':
                         context_latent = world_model.encode_obs(torch.cat(list(context_obs), dim=1))
-                        prior_flattened_sample, last_dist_feat = world_model.calc_last_dist_feat(context_latent, model_context_action)
+                        prior_flattened_sample, last_dist_feat = world_model.calc_last_dist_feat(context_latent, model_context_action, termination=context_done)
                         action_input = torch.cat([prior_flattened_sample, last_dist_feat], dim=-1) 
                     else:
                         context_latent = world_model.encode_obs(torch.cat(list(context_obs), dim=1))
@@ -147,7 +147,7 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
                         greedy=False
                     )
 
-            if len(context_obs) < 16:
+            if len(context_obs) < 16 and model_name == 'OC-irisXL': # HACK
                 mems = world_model.storm_transformer.init_mems()
 
             context_obs.append(rearrange(torch.Tensor(current_obs).to(device), "B H W C -> B 1 C H W")/255)
