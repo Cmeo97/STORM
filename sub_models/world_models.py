@@ -1159,6 +1159,10 @@ class WorldModel(nn.Module):
             discrete_input = self.flatten_sample(sample)
             print(f"Embedding: {embedding.shape}")
             continuos_input = self.oc_dist_head.forward_post(embedding)
+            _action = self.continuos_storm_transformer.action_embedder(action.int()).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=1).reshape(continuos_input.shape[0], continuos_input.shape[1], self.conf.Models.Slot_attn.num_slots, -1)
+            continuos_input = self.stem(continuos_input, _action)
+            if self.continuos:
+                continuos_input = self.continuos_storm_transformer.wm_oc_pool_layer(continuos_input)
             print(continuos_input.shape)
             # continuos transformer
             history_length = embedding.shape[1]
