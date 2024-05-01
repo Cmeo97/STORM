@@ -50,7 +50,7 @@ def train_world_model_step(replay_buffer: ReplayBuffer, world_model: WorldModel,
     obs, action, reward, termination = replay_buffer.sample(batch_size, demonstration_batch_size, batch_length, device)
     # world_model.update(obs, action, reward, termination, logger=logger, log_recs=log_recs)
     world_model.update_dino(obs, action, reward, termination, logger=logger, log_recs=log_recs)
-    world_model.update_wm(obs, action, reward, termination, logger=logger, log_recs=log_recs)
+    world_model.update_asymmetric_wm(obs, action, reward, termination, logger=logger, log_recs=log_recs)
 
 def train_dino_step(replay_buffer: ReplayBuffer, world_model: WorldModel, batch_size, demonstration_batch_size, batch_length, logger, device, log_recs):
     obs, action, reward, termination = replay_buffer.sample(batch_size, demonstration_batch_size, batch_length, device)

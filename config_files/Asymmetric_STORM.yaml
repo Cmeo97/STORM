@@ -10,13 +10,13 @@ BasicSettings:
   config_path: config_files/Asymmetric_STORM.yam
   env_name: ALE/Boxing-v5
   trajectory_path: trajectories/Boxing/Boxing.pkl
-  device: cuda:1
+  device: cuda:0
   pretrained_path: None
 
 
 hydra:
   run:
-    dir: /space/cristianmeo/STORM #/projects/0/prjs0951/STORM
+    dir: /space2/mlica/ocwm #/projects/0/prjs0951/STORM
 
 
 JointTrainAgent:
@@ -92,7 +92,7 @@ Models:
     vit_feature_level: 12
     independent_modules: True
     stochastic_head: False
-    stochastic_dim: 32  #16*16 = 256
+    stochastic_dim: 49  #16*16 = 256
     action_emb_dim: 128
     wm_oc_pool_layer: dino-mlp 
     mixer_type: z+attn
@@ -133,6 +133,21 @@ Models:
     EntropyCoef: 3E-4
     pooling_layer: dino-mlp  #cls-transformer dino-sbd
     state: joint
+
+  MaskGit:
+    VocabSize: 32
+    VocabDim: 128
+    T_revise: 1
+    T_draft: 1
+    M: 1
+    MaskSchedule: "cosine"
+    TmfArgs:
+      EmbedDim: 128
+      MlpDim: 128
+      NumHeads: 8
+      NumLayers: 4
+      Dropout: 0.0
+      AttentionDropout: 0.0
 
   CLSTransformer:
     HiddenDim: 256

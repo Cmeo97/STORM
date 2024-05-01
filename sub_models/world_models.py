@@ -21,6 +21,8 @@ from torch.utils._foreach_utils import _group_tensors_by_device_and_dtype, _has_
 _tensor_or_tensors = Union[torch.Tensor, Iterable[torch.Tensor]]
 from .dino_transformer_utils import *
 
+from sub_models.torch_maskgit import MaskGit
+
 def linear_warmup_exp_decay(warmup_steps: Optional[int] = None, exp_decay_rate: Optional[float] = None, exp_decay_steps: Optional[int] = None):
     assert (exp_decay_steps is None) == (exp_decay_rate is None)
     use_exp_decay = exp_decay_rate is not None
@@ -145,7 +147,16 @@ class DistHead(nn.Module):
     def __init__(self, image_feat_dim, transformer_hidden_dim, stoch_dim) -> None:
         super().__init__()
         self.stoch_dim = stoch_dim
-        self.post_head = nn.Linear(image_feat_dim, stoch_dim*stoch_dim)
+        self.post_head = nn.Sequential(
+            nn.Linear(768, 384),
+            nn.GELU(),
+            nn.Linear(384, 192),
+            nn.GELU(),
+            nn.Linear(192, 96),
+            nn.GELU(),
+            nn.Linear(96, stoch_dim)
+        )
+        self.post_post_head = nn.Linear(196, 49)
         self.prior_head = nn.Linear(transformer_hidden_dim, stoch_dim*stoch_dim)
         def init_weights(m):
             if isinstance(m, nn.Linear):
@@ -163,7 +174,8 @@ class DistHead(nn.Module):
 
     def forward_post(self, x):
         logits = self.post_head(x)
-        logits = rearrange(logits, "B L (K C) -> B L K C", K=self.stoch_dim)
+        logits = logits.reshape(*logits.shape[:-2], 49, 196)
+        logits = self.post_post_head(logits)
         logits = self.unimix(logits)
         return logits
 
@@ -333,10 +345,12 @@ class CategoricalKLDivLossWithFreeBits(nn.Module):
         super().__init__()
         self.free_bits = free_bits
 
-    def forward(self, p_logits, q_logits):
+    def forward(self, p_logits, q_logits, z_mask=None):
         p_dist = OneHotCategorical(logits=p_logits)
         q_dist = OneHotCategorical(logits=q_logits)
         kl_div = torch.distributions.kl.kl_divergence(p_dist, q_dist)
+        if z_mask is not None:
+            kl_div = kl_div * z_mask
         kl_div = reduce(kl_div, "B L D -> B L", "sum")
         kl_div = kl_div.mean()
         real_kl_div = kl_div
@@ -469,7 +483,7 @@ class WorldModel(nn.Module):
 
             self.image_decoder = DecoderBN(
                 stoch_dim=self.stoch_flattened_dim,
-                last_channels=self.encoder.last_channels,
+                last_channels=512,
                 original_in_channels=in_channels,
                 stem_channels=32,
                 final_feature_width=self.final_feature_width
@@ -526,6 +540,23 @@ class WorldModel(nn.Module):
             self.discrete_termination_decoder = TerminationDecoder(
                 embedding_size=transformer_hidden_dim,
                 transformer_hidden_dim=transformer_hidden_dim
+            )
+
+            self.maskgit = MaskGit(
+                shape=None,
+                vocab_size=conf.Models.MaskGit.VocabSize,
+                vocab_dim=conf.Models.MaskGit.VocabDim,
+                mask_schedule=conf.Models.MaskGit.MaskSchedule,
+                tfm_kwargs={
+                    "embed_dim": conf.Models.MaskGit.TmfArgs.EmbedDim,
+                    "mlp_dim": conf.Models.MaskGit.TmfArgs.MlpDim,
+                    "num_heads": conf.Models.MaskGit.TmfArgs.NumHeads,
+                    "num_layers": conf.Models.MaskGit.TmfArgs.NumLayers,
+                    "dropout": conf.Models.MaskGit.TmfArgs.Dropout,
+                    "attention_dropout": conf.Models.MaskGit.TmfArgs.AttentionDropout,
+                    "vocab_dim": conf.Models.MaskGit.VocabDim,
+                    "input_dim": self.transformer_hidden_dim // self.stoch_dim,
+                }
             )
             
             self.downsample = Resize(size=(conf.Models.Decoder.resolution, conf.Models.Decoder.resolution))
@@ -639,8 +670,12 @@ class WorldModel(nn.Module):
                 src_length = tgt_length = latent.shape[1]
                 temporal_mask = get_causal_mask(src_length, tgt_length, device, torch.tensor(termination).t().to(device), slot_based=False, generation=True)
                 dist_feat = self.discrete_storm_transformer(latent, action, temporal_mask)
-                prior_logits = self.dist_head.forward_prior(dist_feat[:, -1:]) # Change with MaskGIT 
-                prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
+                last_dist_feat = dist_feat[:, -1:]
+                rdist = rearrange(last_dist_feat, "B 1 (K C) -> (B 1) K C", K=self.stoch_dim)
+                sample_shape=(self.stoch_dim)
+                prior_sample =  self.maskgit.sample(rdist.shape[0], self.T_draft, self.T_revise, self.M, cond=rdist, sample_shape=sample_shape)
+                prior_sample = rearrange(prior_sample, "(B 1) K -> B 1 K", B=rdist.shape[0])
+                prior_sample = F.one_hot(prior_sample, num_classes=self.stoch_dim).float()
                 prior_flattened_sample = self.flatten_sample(prior_sample)
                 return prior_flattened_sample, dist_feat[:, -1:]
             elif conf.Models.WorldModel.model == 'OC-irisXL':
@@ -689,8 +724,12 @@ class WorldModel(nn.Module):
 
             # decoding
             if conf.Models.WorldModel.model == 'Asymmetric-OC-STORM' and not context:
-                prior_logits = self.dist_head.forward_prior(dist_feat, generation=True) ## TO BE Replaced with MASKGIT
-                prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
+                sample_shape=(self.stoch_dim)
+                rdist = rearrange(dist_feat, "B 1 (K C) -> (B 1) K C", K=self.stoch_dim)
+                prior_sample =  self.maskgit.sample(rdist.shape[0], self.T_draft, self.T_revise, self.M, cond=rdist, sample_shape=sample_shape)
+                prior_sample = rearrange(prior_sample, "(B 1) K -> B 1 K", B=rdist.shape[0])
+                prior_sample = F.one_hot(prior_sample, num_classes=self.stoch_dim).float()
+
                 prior_flattened_sample = self.flatten_sample(prior_sample)
             elif self.conf.Models.WorldModel.model == 'OC-irisXL': 
                 prior_flattened_sample = slots_hat = self.slots_head(last_slots, dist_feat)
@@ -1101,19 +1140,26 @@ class WorldModel(nn.Module):
         # train wm
         self.eval()
         self.dist_head.train()
-        self.storm_transformer.train()
-        self.slots_head.train()
-        self.reward_decoder.train()
-        self.termination_decoder.train()
+        self.discrete_storm_transformer.train()
+        self.continuos_storm_transformer.train()
+        self.discrete_reward_decoder.train()
+        self.continuos_reward_decoder.train()
+        self.discrete_termination_decoder.train()
+        self.continuos_termination_decoder.train()
         batch_size, batch_length = obs.shape[:2]
 
         with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
             with torch.no_grad():
                 embedding, _, z_vit = self.dino.dino_encode(obs)
 
+            print(z_vit.shape)
             post_logits = self.dist_head.forward_post(z_vit) 
-            discrete_input = self.flatten_sample(self.stright_throught_gradient(post_logits, sample_mode="random_sample")) 
+            sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample") 
+            sample_encodings = torch.argmax(sample, dim=-1)
+            discrete_input = self.flatten_sample(sample)
+            print(f"Embedding: {embedding.shape}")
             continuos_input = self.oc_dist_head.forward_post(embedding)
+            print(continuos_input.shape)
             # continuos transformer
             history_length = embedding.shape[1]
             src_length = tgt_length = history_length #* self.conf.Models.Slot_attn.num_slots 
@@ -1146,12 +1192,21 @@ class WorldModel(nn.Module):
             #slots_loss = F.mse_loss(embedding.detach(), slots_hat)
             # dyn-rep loss
             continuos_wm_loss = continuos_reward_loss + continuos_termination_loss + continuos_dyn_loss
-            discrete_wm_loss = discrete_reward_loss + discrete_termination_loss 
+            discrete_wm_loss = discrete_reward_loss + discrete_termination_loss
 
-            prior_logits = self.dist_head.forward_prior(discrete_dist_feat)  ## to be replace with maskgit
+            # chage the shape of dist_feat such that it matches the shape required by maskgit
+            discrete_dist_feat = rearrange(discrete_dist_feat, "B L (K C) -> (B L) K C", K=self.stoch_dim)
+            sample_encodings = rearrange(sample_encodings, "B L K -> (B L) K")
+            z_logits, z_labels, z_mask = self.maskgit(sample_encodings, discrete_dist_feat)
+            z_logits = rearrange(z_logits, "(B L) K C -> B L K C", B=batch_size) # bring back to original shape
+            z_logits = self.dist_head.unimix(z_logits) # NOTE: add unimix to the logits
+            z_labels = rearrange(z_labels, "(B L) K C -> B L K C", B=batch_size) # bring back to original shape
+            z_mask = rearrange(z_mask, "(B L) K -> B L K", B=batch_size) # bring back to original shape
+            discrete_dist_feat = rearrange(discrete_dist_feat, "(B L) K C -> B L (K C)", B=batch_size) # bring back to original shape
+
             
-            discrete_dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]).detach(), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]))
-            representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]), prior_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]).detach())
+            discrete_dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]).detach(), z_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]), z_mask[:, :-1].reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]))
+            representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].reshape(-1,  *post_logits.shape[2:]), z_logits.reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]).detach(), z_mask[:, :-1].reshape(*post_logits.shape)[:, :-1].reshape(-1,  *post_logits.shape[2:]).detach())
             discrete_wm_loss += 0.5*discrete_dynamics_loss + 0.1*representation_loss
 
         self.scaler.scale(continuos_wm_loss).backward()

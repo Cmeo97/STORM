@@ -68,6 +68,7 @@ class MultiHeadAttention_(nn.Module):
             num_output_channels = num_kv_input_channels
 
         if num_qk_channels % num_heads != 0:
+            print(num_qk_channels, num_heads)
             raise ValueError("num_qk_channels must be divisible by num_heads")
 
         if num_v_channels % num_heads != 0:
@@ -115,7 +116,7 @@ class MultiHeadAttention_(nn.Module):
         k = self.k_proj(x_kv)
         v = self.v_proj(x_kv)
 
-        q, k, v = (rearrange(x, "b n (h c) -> b h n c", h=self.num_heads) for x in [q, k, v])
+        q, k, v = (rearrange(x, "b n m (h c) -> b h n c", h=self.num_heads) for x in [q, k, v])
         q = q * self.dp_scale
 
         if self.causal_attention:

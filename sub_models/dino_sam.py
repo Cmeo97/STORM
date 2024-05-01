@@ -350,6 +350,7 @@ class DinoSAM_OCextractor(nn.Module):
             model.norm = nn.Identity()
 
         self.vit = model
+        print(self.vit)
         self._feature_dim = feature_dim
 
         if self.vit_freeze:
@@ -415,6 +416,7 @@ class DinoSAM_OCextractor(nn.Module):
             self.eval()
   
         if self.vit_freeze:
+            print(f"Shape: {x.shape}")
             # Speed things up a nvidiabit by not requiring grad computation.
             with torch.no_grad():
                 features = self.vit.forward_features(x)

@@ -23,6 +23,7 @@ class StateMixer(nn.Module):
             
         elif self.type_mixer == 'z+attn':
             input_dim = z_dim 
+            print(num_heads, z_dim, action_dim)
             self.mha = CrossAttention(num_heads, z_dim, action_dim)
         else:
            raise f'Mixer of type {self.type_mixer} not defined, modify config file!'
@@ -90,6 +91,7 @@ class StochasticTransformerKVCache(nn.Module):
             self.action_embedder = nn.Embedding(action_dim, self.conf.Models.WorldModel.action_emb_dim)
             self.stem = StateMixer(stoch_dim, self.conf.Models.WorldModel.action_emb_dim, feat_dim, type=mixer_type, num_heads=num_head_mixer)
         else:
+            num_head_mixer = 6
             self.stem = StateMixer(stoch_dim, self.action_dim, feat_dim, type=mixer_type, num_heads=num_head_mixer)
         # mix image_embedding and action
         #self.stem = nn.Sequential(
