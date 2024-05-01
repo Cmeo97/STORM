@@ -10,7 +10,7 @@ BasicSettings:
   config_path: config_files/Asymmetric_STORM.yam
   env_name: ALE/Boxing-v5
   trajectory_path: trajectories/Boxing/Boxing.pkl
-  device: cuda:1
+  device: cuda:0
   pretrained_path: None
 
 

@@ -213,7 +213,7 @@ class OCDistHead(nn.Module):
     def __init__(self, image_feat_dim, transformer_hidden_dim, stoch_dim) -> None:
         super().__init__()
         self.stoch_dim = stoch_dim
-        self.post_head = nn.Linear(image_feat_dim, stoch_dim*stoch_dim)
+        self.post_head = nn.Linear(image_feat_dim, image_feat_dim*2)
         #self.prior_head = nn.Linear(transformer_hidden_dim, stoch_dim*stoch_dim)
 
     def forward_post(self, x):
@@ -456,7 +456,7 @@ class WorldModel(nn.Module):
             self.dino = DinoSAM_OCextractor(conf.Models.WorldModel, decoder_config, slot_attn_config)
             
             self.continuos_storm_transformer = StochasticTransformerKVCache(
-                stoch_dim=self.stoch_flattened_dim,
+                stoch_dim=conf.Models.Slot_attn.token_dim*2,
                 action_dim=action_dim,
                 feat_dim=transformer_hidden_dim,
                 num_layers=transformer_num_layers,
@@ -1169,7 +1169,7 @@ class WorldModel(nn.Module):
             continuos_dist_feat = self.continuos_storm_transformer(continuos_input, action, temporal_mask) 
 
             # discrete transformer
-            discrete_dist_feat = self.storm_transformer(discrete_input, action, temporal_mask) 
+            discrete_dist_feat = self.discrete_storm_transformer(discrete_input, action, temporal_mask) 
 
             # decoding reward and termination with dist_feat
             #slots_hat = self.slots_head(embedding.detach(), continuos_dist_feat)

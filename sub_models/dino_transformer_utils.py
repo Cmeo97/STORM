@@ -93,7 +93,14 @@ class MultiHeadAttention_(nn.Module):
         self.o_proj = nn.Linear(num_v_channels, num_output_channels, bias=out_bias)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(
+    def forward(self, x_q, x_kv):
+        if len(x_q.shape) == 4:
+            return self.forward4(x_q, x_kv)
+
+        return self.forward3(x_q, x_kv)
+
+
+    def forward4(
         self,
         x_q: torch.Tensor,
         x_kv: torch.Tensor,
@@ -149,6 +156,64 @@ class MultiHeadAttention_(nn.Module):
 
         o = torch.cat(o_chunks, dim=1)
         o = rearrange(o, "b h n l c -> b n l (h c)", h=self.num_heads)
+        return self.o_proj(o)
+    
+    def forward3(
+        self,
+        x_q: torch.Tensor,
+        x_kv: torch.Tensor,
+    ):
+        """...
+
+        :param x_q: Query input of shape (B, N, D) where B is the batch size, N the query sequence length and D the
+                number of query input channels (= `num_q_input_channels`)
+        :param x_kv: Key/value input of shape (B, L, C) where B is the batch size, L the key/value sequence length and C
+                are the number of key/value input channels (= `num_kv_input_channels`)
+        :param pad_mask: Boolean key padding mask. `True` values indicate padding tokens.
+        :param rot_pos_emb_q: Applies a rotary position embedding to query i.e. if defined, rotates the query.
+        :param rot_pos_emb_k: Applies a rotary position embedding to key i.e. if defined, rotates the key.
+        :param kv_cache: cache with past keys and values.
+        :return: attention result of shape (B, N, F) where B is the batch size, N the query sequence length and F the
+                number of output channels (= `num_output_channels`)
+        """
+
+        q = self.q_proj(x_q)
+        k = self.k_proj(x_kv)
+        v = self.v_proj(x_kv)
+
+        q, k, v = (rearrange(x, "b n (h c) -> b h n c", h=self.num_heads) for x in [q, k, v])
+        q = q * self.dp_scale
+
+        if self.causal_attention:
+            i = q.shape[2]
+            j = k.shape[2]
+
+            # If q and k have different length, causal masking only works if they are right-aligned.
+            causal_mask = torch.ones((i, j), device=x_q.device, dtype=torch.bool).triu(j - i + 1)
+
+        o_chunks = []
+
+        # Only process a given maximum number of heads in
+        # parallel, using several iterations, if necessary.
+        for q_chunk, k_chunk, v_chunk in zip(
+            q.split(self.max_heads_parallel, dim=1),
+            k.split(self.max_heads_parallel, dim=1),
+            v.split(self.max_heads_parallel, dim=1),
+        ):
+            attn = torch.einsum("b h i c, b h j c -> b h i j", q_chunk, k_chunk)
+            attn_max_neg = -torch.finfo(attn.dtype).max
+
+            if self.causal_attention:
+                attn.masked_fill_(causal_mask, attn_max_neg)
+
+            attn = attn.softmax(dim=-1)
+            attn = self.dropout(attn)
+
+            o_chunk = torch.einsum("b h i j, b h j c -> b h i c", attn, v_chunk)
+            o_chunks.append(o_chunk)
+
+        o = torch.cat(o_chunks, dim=1)
+        o = rearrange(o, "b h n c -> b n (h c)", h=self.num_heads)
         return self.o_proj(o)
 
         
