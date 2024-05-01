@@ -520,7 +520,7 @@ class WorldModel(nn.Module):
             #        )
                 
             self.dino_head = DinoHead(
-                embedding_size=conf.Models.Decoder.dec_input_dim,
+                embedding_size=transformer_hidden_dim,
                 transformer_hidden_dim=transformer_hidden_dim
             )
             self.continuos_reward_decoder = RewardDecoder(
@@ -614,6 +614,7 @@ class WorldModel(nn.Module):
 
 
         self.mse_loss_func = MSELoss()
+        self.mse_loss = nn.MSELoss()
         self.ce_loss = nn.CrossEntropyLoss()
         self.bce_with_logits_loss_func = nn.BCEWithLogitsLoss()
         self.symlog_twohot_loss_func = SymLogTwoHotLoss(num_classes=255, lower_bound=-20, upper_bound=20)
@@ -1159,11 +1160,11 @@ class WorldModel(nn.Module):
             discrete_input = self.flatten_sample(sample)
             print(f"Embedding: {embedding.shape}")
             continuos_input = self.oc_dist_head.forward_post(embedding)
-            _action = self.continuos_storm_transformer.action_embedder(action.int()).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=1).reshape(continuos_input.shape[0], continuos_input.shape[1], self.conf.Models.Slot_attn.num_slots, -1)
-            continuos_input = self.stem(continuos_input, _action)
-            if self.continuos:
-                continuos_input = self.continuos_storm_transformer.wm_oc_pool_layer(continuos_input)
-            print(continuos_input.shape)
+            with torch.no_grad():
+                _action = self.continuos_storm_transformer.action_embedder(action.int()).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=1).reshape(continuos_input.shape[0], continuos_input.shape[1], self.conf.Models.Slot_attn.num_slots, -1)
+                continuos_input_ = self.continuos_storm_transformer.stem(continuos_input, _action)
+                continuos_input_target = self.continuos_storm_transformer.wm_oc_pool_layer(continuos_input_)
+            
             # continuos transformer
             history_length = embedding.shape[1]
             src_length = tgt_length = history_length #* self.conf.Models.Slot_attn.num_slots 
@@ -1191,7 +1192,7 @@ class WorldModel(nn.Module):
             continuos_termination_loss = self.bce_with_logits_loss_func(continuos_termination_hat, termination)
             discrete_termination_loss = self.bce_with_logits_loss_func(discrete_termination_hat, termination)
 
-            continuos_dyn_loss = self.mse_loss_func(z_vit_hat[:, :-1], z_vit[:, 1:])
+            continuos_dyn_loss = self.mse_loss(z_vit_hat[:, :-1], continuos_input_target[:, 1:])
 
             #slots_loss = F.mse_loss(embedding.detach(), slots_hat)
             # dyn-rep loss
