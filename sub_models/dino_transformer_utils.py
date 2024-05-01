@@ -116,7 +116,7 @@ class MultiHeadAttention_(nn.Module):
         k = self.k_proj(x_kv)
         v = self.v_proj(x_kv)
 
-        q, k, v = (rearrange(x, "b n m (h c) -> b h n c", h=self.num_heads) for x in [q, k, v])
+        q, k, v = (rearrange(x, "b n m (h c) -> b h n m c", h=self.num_heads) for x in [q, k, v])
         q = q * self.dp_scale
 
         if self.causal_attention:
@@ -135,7 +135,7 @@ class MultiHeadAttention_(nn.Module):
             k.split(self.max_heads_parallel, dim=1),
             v.split(self.max_heads_parallel, dim=1),
         ):
-            attn = torch.einsum("b h i c, b h j c -> b h i j", q_chunk, k_chunk)
+            attn = torch.einsum("b h l i c, b h l j c -> b h l i j", q_chunk, k_chunk)
             attn_max_neg = -torch.finfo(attn.dtype).max
 
             if self.causal_attention:
@@ -144,11 +144,11 @@ class MultiHeadAttention_(nn.Module):
             attn = attn.softmax(dim=-1)
             attn = self.dropout(attn)
 
-            o_chunk = torch.einsum("b h i j, b h j c -> b h i c", attn, v_chunk)
+            o_chunk = torch.einsum("b h l i j, b h l j c -> b h l i c", attn, v_chunk)
             o_chunks.append(o_chunk)
 
         o = torch.cat(o_chunks, dim=1)
-        o = rearrange(o, "b h n c -> b n (h c)", h=self.num_heads)
+        o = rearrange(o, "b h n l c -> b n l (h c)", h=self.num_heads)
         return self.o_proj(o)
 
         

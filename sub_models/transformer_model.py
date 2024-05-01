@@ -86,11 +86,13 @@ class StochasticTransformerKVCache(nn.Module):
         num_head_mixer = 4 if 'attn' in mixer_type else None
         self.continuos = continuos
         self.conf = conf
-        if continuos:
+        if continuos:  
+            #self.pool_dim = lambda x :rearrange(x, 'B T S E->B (T S) E')
             self.wm_oc_pool_layer = BroadcastPoolLayer(feat_dim, [feat_dim, feat_dim], feat_dim)
             self.action_embedder = nn.Embedding(action_dim, self.conf.Models.WorldModel.action_emb_dim)
             self.stem = StateMixer(stoch_dim, self.conf.Models.WorldModel.action_emb_dim, feat_dim, type=mixer_type, num_heads=num_head_mixer)
         else:
+            #self.pool_dim = lambda x: x
             num_head_mixer = 6
             self.stem = StateMixer(stoch_dim, self.action_dim, feat_dim, type=mixer_type, num_heads=num_head_mixer)
         # mix image_embedding and action
@@ -111,7 +113,8 @@ class StochasticTransformerKVCache(nn.Module):
         '''
         Normal forward pass
         '''
-        action = F.one_hot(action.long(), self.action_dim).float() if not self.continuos else self.action_embedder(action.int()).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=1)
+        b, t = action.shape
+        action = F.one_hot(action.long(), self.action_dim).float() if not self.continuos else self.action_embedder(action.int()).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=1).reshape(b, t, self.conf.Models.Slot_attn.num_slots, -1)
         feats = self.stem(samples, action)
         if self.continuos:
             feats = self.wm_oc_pool_layer(feats)
