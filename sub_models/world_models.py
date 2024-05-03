@@ -572,7 +572,7 @@ class WorldModel(nn.Module):
             
             self.downsample = Resize(size=(conf.Models.Decoder.resolution, conf.Models.Decoder.resolution))
             self.dino_parameters = list(self.dino.parameters()) 
-            self.continuos_wm_parameters = list(self.continuos_storm_transformer.parameters()) + list(self.dino_head.parameters()) + list(self.continuos_termination_decoder.parameters()) + list(self.continuos_reward_decoder.parameters()) + list(self.oc_dist_head.parameters()) 
+            self.continuos_wm_parameters = list(self.continuos_storm_transformer.parameters()) + list(self.dino_head.parameters()) + list(self.continuos_termination_decoder.parameters()) + list(self.oc_dist_head.parameters()) 
             self.discrete_wm_parameters = list(self.discrete_storm_transformer.parameters()) + list(self.discrete_termination_decoder.parameters()) + list(self.discrete_reward_decoder.parameters()) + list(self.dist_head.parameters()) 
             # Indexes of parameters list: idx0-idx1 related module |0-54 wm | 55-81 pool_layer | 82-85 slots_head | 86-93 termination_decoder | 94-101 reward_decoder | 102-106 dist_head 
             self.dec_parameters = list(self.image_decoder.parameters())
@@ -1239,12 +1239,25 @@ class WorldModel(nn.Module):
             representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:], z_logits[:, :-1].detach(), z_mask[:, :-1].detach())
             discrete_wm_loss += 0.5*discrete_dynamics_loss + 0.1*representation_loss
 
+
+        if (continuos_wm_loss.grad == torch.nan) or (continuos_wm_loss.grad == torch.inf) or (continuos_wm_loss.grad == -torch.inf):
+            print('fuck')
+        print(continuos_wm_loss.grad, continuos_wm_loss)
         self.scaler.scale(continuos_wm_loss).backward()
+        print(continuos_wm_loss.grad, continuos_wm_loss)
+        if (continuos_wm_loss.grad == torch.nan) or (continuos_wm_loss.grad == torch.inf) or (continuos_wm_loss.grad == -torch.inf):
+            print('fuck')
         self.scaler.unscale_(self.continuos_wm_optimizer)  # for clip grad
+        print(continuos_wm_loss.grad, continuos_wm_loss)
         #trial_norm = self.trial_clip_grad_norm_(self.wm_parameters, max_norm=10.0)
-        continuos_wm_norm = torch.nn.utils.clip_grad_norm_(self.continuos_wm_parameters, max_norm=10.0)
+        #print(self.continuos_wm_parameters[97].grad)
+        #if (self.continuos_wm_parameters[97].grad == torch.nan).any() or (self.continuos_wm_parameters[97].grad == torch.inf).any() or (self.continuos_wm_parameters[97].grad == -torch.inf).any():
+        #    print('fuck')
+        continuos_wm_norm = torch.nn.utils.clip_grad_norm_(self.continuos_wm_parameters, max_norm=10.0, error_if_nonfinite=True)
         self.scaler.step(self.continuos_wm_optimizer)
+        #print(continuos_wm_loss.grad, continuos_wm_loss)
         self.scaler.update()
+        #print(continuos_wm_loss.grad, continuos_wm_loss)
 
         if self.continuos_wm_scheduler is not None: #TODO: currently this is None
             self.continuos_wm_scheduler.step()

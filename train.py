@@ -198,7 +198,7 @@ def joint_train_world_model_agent(model_name, env_name, max_steps, num_envs, ima
                 log_recs=log_recs
             )
         # train world model part >>>
-        if replay_buffer.ready() and total_steps % (train_dynamics_every_steps//num_envs) == 0: # and total_steps >= 63000:
+        if replay_buffer.ready() and total_steps % (train_dynamics_every_steps//num_envs) == 0 and total_steps >= 63000:
             log_recs = True if total_steps % (save_every_steps//num_envs) == 0 else False
             train_world_model_step(
                 replay_buffer=replay_buffer,
