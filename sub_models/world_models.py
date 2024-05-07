@@ -572,7 +572,7 @@ class WorldModel(nn.Module):
             
             self.downsample = Resize(size=(conf.Models.Decoder.resolution, conf.Models.Decoder.resolution))
             self.dino_parameters = list(self.dino.parameters()) 
-            self.continuos_wm_parameters = list(self.continuos_storm_transformer.parameters()) + list(self.dino_head.parameters()) + list(self.continuos_termination_decoder.parameters()) + list(self.oc_dist_head.parameters()) 
+            self.continuos_wm_parameters = list(self.continuos_storm_transformer.parameters()) + list(self.dino_head.parameters()) + list(self.continuos_termination_decoder.parameters()) + list(self.oc_dist_head.parameters()) + list(self.continuos_reward_decoder.parameters())
             self.discrete_wm_parameters = list(self.discrete_storm_transformer.parameters()) + list(self.discrete_termination_decoder.parameters()) + list(self.discrete_reward_decoder.parameters()) + list(self.dist_head.parameters()) 
             # Indexes of parameters list: idx0-idx1 related module |0-54 wm | 55-81 pool_layer | 82-85 slots_head | 86-93 termination_decoder | 94-101 reward_decoder | 102-106 dist_head 
             self.dec_parameters = list(self.image_decoder.parameters())
@@ -704,24 +704,29 @@ class WorldModel(nn.Module):
                 prior_flattened_sample = self.flatten_sample(prior_sample) if self.conf.Models.WorldModel.stochastic_head else prior_sample
                 return prior_flattened_sample, dist_feat[:, -1:], mems
 
-    def predict_next(self, last_flattened_sample, last_slots, action, termination, log_video=True, mems=None, device=None, context=False):
+    def predict_next(self, last_flattened_sample, last_slots, action, termination, log_video=True, mems=None, device=None, context=False, last_from_context=False):
         with torch.autocast(device_type='cuda', dtype=self.tensor_dtype, enabled=self.use_amp):
             if self.conf.Models.WorldModel.model == 'STORM':
                 dist_feat = self.storm_transformer.forward_with_kv_cache(last_flattened_sample, action)
             elif self.conf.Models.WorldModel.model == 'Asymmetric-OC-STORM':
                 if context:
-                    continuos_input = self.oc_dist_head.forward_post(last_slots)
+                    continuos_input = last_flattened_sample
                     # continuos transformer
                     history_length = last_flattened_sample.shape[1]
                     src_length = tgt_length = history_length  
                     device = last_flattened_sample.device
                     #positions = torch.arange(history_length - 1, -1, -1, device=device).repeat_interleave(self.conf.Models.Slot_attn.num_slots, dim=0).long() if self.conf.Models.WorldModel.slot_based  else torch.arange(src_length - 1, -1, -1, device=device) 
-                    temporal_mask = get_causal_mask(src_length, tgt_length, last_slots.device, termination, self.conf.Models.Slot_attn.num_slots, slot_based=False, generation=True)
+                    temporal_mask = get_causal_mask(src_length, tgt_length, device, termination, self.conf.Models.Slot_attn.num_slots, slot_based=False, generation=True)
                     dist_feat = self.continuos_storm_transformer(continuos_input, action, temporal_mask) 
                 else:
-                    src_length = last_flattened_sample.shape[1]
-                    temporal_mask = get_causal_mask(src_length, termination, generation=True, slot_based=False)
-                    dist_feat = self.discrete_storm_transformer.forward_with_kv_cache(last_flattened_sample, action, temporal_mask)
+                    if last_from_context:
+                        post_logits = self.dist_head.forward_post(last_slots)
+                        sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
+                        discrete_input = self.flatten_sample(sample)
+                    else:
+                        discrete_input = last_flattened_sample
+                    src_length = tgt_length = last_flattened_sample.shape[1]
+                    dist_feat = self.discrete_storm_transformer.forward_with_kv_cache(discrete_input, action)
             elif self.conf.Models.WorldModel.model == 'OC-irisXL':
                 src_length = last_flattened_sample.shape[1] * self.conf.Models.Slot_attn.num_slots
                 src_length = src_length + mems[0].shape[0] if mems is not None else src_length
@@ -743,6 +748,8 @@ class WorldModel(nn.Module):
                 prior_sample = F.one_hot(prior_sample, num_classes=self.stoch_dim).float()
 
                 prior_flattened_sample = self.flatten_sample(prior_sample)
+            elif self.conf.Models.WorldModel.model == 'Asymmetric-OC-STORM':
+                prior_flattened_sample = None # does not matter during context
             elif self.conf.Models.WorldModel.model == 'OC-irisXL': 
                 prior_flattened_sample = slots_hat = self.slots_head(last_slots, dist_feat)
             
@@ -772,11 +779,16 @@ class WorldModel(nn.Module):
                 termination_hat = self.termination_decoder(combined_dist_feat)
                 termination_hat = termination_hat > 0
             else:
-                reward_hat = self.reward_decoder(dist_feat)
-                reward_hat = self.symlog_twohot_loss_func.decode(reward_hat)
-                termination_hat = self.termination_decoder(dist_feat)
-                termination_hat = termination_hat > 0
-  
+                if context:
+                    reward_hat = self.continuos_reward_decoder(dist_feat)
+                    reward_hat = self.symlog_twohot_loss_func.decode(reward_hat)
+                    termination_hat = self.continuos_termination_decoder(dist_feat)
+                    termination_hat = termination_hat > 0
+                else:
+                    reward_hat = self.discrete_reward_decoder(dist_feat)
+                    reward_hat = self.symlog_twohot_loss_func.decode(reward_hat)
+                    termination_hat = self.discrete_termination_decoder(dist_feat)
+                    termination_hat = termination_hat > 0
         return output_hat, reward_hat, termination_hat, prior_flattened_sample, dist_feat, mems
 
     def stright_throught_gradient(self, logits, sample_mode="random_sample"):
@@ -845,7 +857,7 @@ class WorldModel(nn.Module):
         if log_video:
             sample_obs, obs_gt = torch.chunk(sample_obs, 2, 1)
        
-        if isinstance(self.storm_transformer, StochasticTransformerKVCache):
+        if isinstance(self.discrete_storm_transformer, StochasticTransformerKVCache):
             self.discrete_storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype, device=device)
             self.continuos_storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype, device=device)
         # context: NEED TO BE FIXED, SHOULD USE CONTINUOS TRANSFORMER
@@ -868,11 +880,12 @@ class WorldModel(nn.Module):
         self.discrete_storm_transformer.kv_cache_list = self.continuos_storm_transformer.kv_cache_list
         _, _, _, last_latent, last_dist_feat, _ = self.predict_next(
                 context_continuos_input[:, sample_obs.shape[1] - 1:sample_obs.shape[1]],
-                context_continuos_input[:, sample_obs.shape[1] - 1:sample_obs.shape[1]],  ## not used, but to be consistent with OC-STORMXL we keep it - same in imagine 
+                context_z_vit[:, sample_obs.shape[1] - 1:sample_obs.shape[1]],  ## not used, but to be consistent with OC-STORMXL we keep it - same in imagine NOTE: this is used 
                 sample_action[:, sample_obs.shape[1] - 1:sample_obs.shape[1]],
                 sample_termination[:, sample_obs.shape[1] - 1:sample_obs.shape[1]],
                 log_video=log_video,
-                context=False
+                context=False,
+                last_from_context=True,
             )
 
 
@@ -906,7 +919,7 @@ class WorldModel(nn.Module):
             self.action_buffer[:, i:i+1] = action
 
             last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat, _ = self.predict_next(
-                self.latent_buffer[:, i:i+1], self.latent_buffer[:, i:i+1], self.action_buffer[:, i:i+1], log_video=log_video, context=False)
+                self.latent_buffer[:, i:i+1], self.latent_buffer[:, i:i+1], self.action_buffer[:, i:i+1], termination=-1, log_video=log_video, context=False)
 
             self.latent_buffer[:, i+1:i+2] = last_latent
             self.hidden_buffer[:, i+1:i+2] = last_dist_feat
@@ -924,7 +937,7 @@ class WorldModel(nn.Module):
             #obs_hat_list = self.compute_image_with_slots(obs_downsampled, obs_hat, colors_hat, masks_hat)
             #logger.log("Imagine/predict_slots_images", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).squeeze(1).cpu().float().detach().numpy(), imagine_batch_length)
 
-        return self.latent_buffer, self.hidden_buffer, self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer
+        return torch.cat([self.latent_buffer, self.hidden_buffer], dim=-1), self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer
 
     
 
